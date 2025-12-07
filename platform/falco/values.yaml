@@ -1,0 +1,222 @@
+driver:
+  kind: modern_ebpf
+
+collectors:
+  kubernetes:
+    enabled: true
+
+tty: true
+
+falco:
+  grpc:
+    enabled: true
+    bind_address: "unix:///var/run/falco/falco.sock"
+    threadiness: 8
+
+  grpc_output:
+    enabled: true
+
+  json_output: true
+  json_include_output_property: true
+  json_include_tags_property: true
+
+  rules_file:
+    - /etc/falco/falco_rules.yaml
+    - /etc/falco/falco_rules.local.yaml
+    - /etc/falco/rules.d
+
+  priority: notice
+
+customRules:
+  rules-custom.yaml: |-
+    # Shell Detection
+    - rule: Detect Shell in Container
+      desc: Detect shell execution in a container
+      condition: >
+        spawned_process and
+        container and
+        shell_procs and
+        proc.pname exists and
+        not proc.pname in (shell_binaries) and
+        not user_shell_container_exclusions
+      output: >
+        Shell spawned in container (user=%user.name user_uid=%user.uid
+        container_id=%container.id container_name=%container.name
+        shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+        container_image=%container.image.repository)
+      priority: WARNING
+      tags: [container, shell, mitre_execution]
+
+    # Crypto Mining Detection
+    - rule: Detect Crypto Mining
+      desc: Detect cryptocurrency mining processes
+      condition: >
+        spawned_process and
+        container and
+        (proc.name in (miners) or
+         proc.cmdline contains "stratum+tcp" or
+         proc.cmdline contains "xmrig" or
+         proc.cmdline contains "cryptonight")
+      output: >
+        Crypto mining detected (user=%user.name container=%container.name
+        process=%proc.name cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [container, cryptomining, mitre_resource_hijacking]
+
+    # Sensitive File Access
+    - rule: Sensitive File Access
+      desc: Detect access to sensitive files
+      condition: >
+        open_read and
+        container and
+        fd.name startswith /etc/shadow or
+        fd.name startswith /etc/passwd or
+        fd.name startswith /etc/kubernetes
+      output: >
+        Sensitive file accessed (user=%user.name file=%fd.name
+        container=%container.name image=%container.image.repository)
+      priority: WARNING
+      tags: [container, filesystem, mitre_credential_access]
+
+    # Privilege Escalation
+    - rule: Privilege Escalation Attempt
+      desc: Detect attempts to escalate privileges
+      condition: >
+        spawned_process and
+        container and
+        (proc.name in (sudo, su, setuid) or
+         proc.cmdline contains "chmod +s" or
+         proc.cmdline contains "chmod u+s")
+      output: >
+        Privilege escalation attempt (user=%user.name command=%proc.cmdline
+        container=%container.name namespace=%k8s.ns.name)
+      priority: CRITICAL
+      tags: [container, privilege_escalation, mitre_privilege_escalation]
+
+    # Reverse Shell Detection
+    - rule: Detect Reverse Shell
+      desc: Detect reverse shell connections
+      condition: >
+        spawned_process and
+        container and
+        ((proc.name in (shell_binaries) and
+          (proc.cmdline contains "/dev/tcp" or
+           proc.cmdline contains "nc -e" or
+           proc.cmdline contains "ncat -e" or
+           proc.cmdline contains "bash -i" or
+           proc.cmdline contains "sh -i")) or
+         (proc.name = "nc" and proc.args contains "-e"))
+      output: >
+        Reverse shell detected (user=%user.name command=%proc.cmdline
+        container=%container.name namespace=%k8s.ns.name)
+      priority: CRITICAL
+      tags: [container, network, reverse_shell, mitre_command_and_control]
+
+    # Kubernetes API Abuse
+    - rule: Unauthorized K8s API Access
+      desc: Detect unauthorized access to Kubernetes API from pods
+      condition: >
+        outbound and
+        container and
+        fd.sip = "10.0.0.1" and
+        k8s.ns.name startswith "team-" and
+        not proc.name in (curl, wget, kubectl)
+      output: >
+        Unexpected K8s API access (user=%user.name process=%proc.name
+        container=%container.name namespace=%k8s.ns.name)
+      priority: WARNING
+      tags: [container, network, k8s_api, mitre_discovery]
+
+    # Container Escape Attempts
+    - rule: Container Escape via Mount
+      desc: Detect attempts to escape container via host mount
+      condition: >
+        spawned_process and
+        container and
+        (proc.cmdline contains "nsenter" or
+         proc.cmdline contains "/proc/1/root" or
+         proc.cmdline contains "chroot")
+      output: >
+        Container escape attempt detected (user=%user.name command=%proc.cmdline
+        container=%container.name namespace=%k8s.ns.name)
+      priority: CRITICAL
+      tags: [container, escape, mitre_privilege_escalation]
+
+    # Outbound Connection to Unusual Ports
+    - rule: Unusual Outbound Connection
+      desc: Detect outbound connections to unusual ports
+      condition: >
+        outbound and
+        container and
+        k8s.ns.name startswith "team-" and
+        not fd.sport in (80, 443, 5432, 6379, 3306, 27017, 9092, 8080, 8443) and
+        not fd.sip.name = "kube-dns.kube-system.svc.cluster.local"
+      output: >
+        Unusual outbound connection (user=%user.name connection=%fd.name
+        container=%container.name namespace=%k8s.ns.name)
+      priority: NOTICE
+      tags: [container, network, mitre_exfiltration]
+
+    # File Download and Execution
+    - rule: Download and Execute
+      desc: Detect download of file followed by execution
+      condition: >
+        spawned_process and
+        container and
+        proc.pname in (curl, wget) and
+        (proc.name in (shell_binaries) or
+         proc.args contains "|" or
+         proc.args contains "sh")
+      output: >
+        Download and execute pattern detected (user=%user.name command=%proc.cmdline
+        container=%container.name namespace=%k8s.ns.name)
+      priority: CRITICAL
+      tags: [container, malware, mitre_execution]
+
+    # Secrets Access from Unexpected Process
+    - rule: Unexpected Secret Access
+      desc: Detect access to mounted secrets from unexpected processes
+      condition: >
+        open_read and
+        container and
+        fd.name startswith "/var/run/secrets/kubernetes.io" and
+        not proc.name in (kubectl, curl, python, java, node)
+      output: >
+        Unexpected secret access (user=%user.name file=%fd.name process=%proc.name
+        container=%container.name namespace=%k8s.ns.name)
+      priority: WARNING
+      tags: [container, secrets, mitre_credential_access]
+
+  lists-custom.yaml: |-
+    - list: miners
+      items: [xmrig, minerd, cpuminer, cgminer, bfgminer, ethminer, nbminer]
+
+    - list: shell_binaries
+      items: [bash, sh, zsh, csh, tcsh, ksh, dash, ash]
+
+    - macro: user_shell_container_exclusions
+      condition: >
+        (container.image.repository endswith "debug" or
+         container.image.repository endswith "debug-tools" or
+         k8s.ns.name = "argo")
+
+falcosidekick:
+  enabled: true
+  fullfqdn: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+serviceMonitor:
+  enabled: true
+
+tolerations:
+  - effect: NoSchedule
+    key: node-role.kubernetes.io/control-plane
+
+nodeSelector: {}

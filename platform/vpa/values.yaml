@@ -1,0 +1,38 @@
+# VPA (Vertical Pod Autoscaler) Helm Values
+# Provides right-sizing recommendations for resource requests
+
+# Recommender - generates recommendations
+recommender:
+  enabled: true
+
+  # Use prometheus metrics for better recommendations
+  extraArgs:
+    prometheus-address: http://prometheus.observability:9090
+    storage: prometheus
+    prometheus-cadvisor-job-name: kubelet
+    pod-recommendation-min-cpu-millicores: 25
+    pod-recommendation-min-memory-mb: 64
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 500Mi
+
+# Updater - applies recommendations (disabled for safety)
+updater:
+  enabled: false  # Only recommendations, no auto-apply
+
+# Admission Controller - mutates pods at creation (disabled for safety)
+admissionController:
+  enabled: false  # Only recommendations, no auto-apply
+
+# Metrics - expose VPA metrics for Prometheus
+metrics:
+  serviceMonitor:
+    enabled: true
+    namespace: vpa-system
+    additionalLabels:
+      release: prometheus

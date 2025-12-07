@@ -1,0 +1,58 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-default-tolerations
+  annotations:
+    policies.kyverno.io/title: Add Default Tolerations
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Adds default tolerations to Pods for spot instance interruptions,
+      ensuring graceful handling of Karpenter node consolidation.
+spec:
+  rules:
+    - name: add-spot-toleration
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - "team-*"
+      mutate:
+        patchStrategicMerge:
+          spec:
+            tolerations:
+              - key: "karpenter.sh/disruption"
+                operator: "Exists"
+                effect: "NoSchedule"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-default-labels
+  annotations:
+    policies.kyverno.io/title: Add Default Labels
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/subject: Pod, Deployment
+    policies.kyverno.io/description: >-
+      Adds default labels to resources for observability and cost tracking.
+spec:
+  rules:
+    - name: add-platform-labels
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+                - Deployment
+                - StatefulSet
+                - Service
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              +(platform.io/managed-by): "kyverno"
+              +(platform.io/environment): "{{request.namespace}}"

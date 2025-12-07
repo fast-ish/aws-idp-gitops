@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: observability
+
+# NOTE: Core observability (metrics, logs, traces) is handled by Grafana Cloud
+# via the k8s-monitoring helm chart deployed through CDK (addons.mustache).
+#
+# This kustomization provides:
+# - Custom PrometheusRules for platform-specific alerting
+# - Custom dashboards for platform components
+# - AlertManager routing configuration
+#
+# Grafana Cloud handles: Prometheus, Loki, Tempo, Pyroscope, OpenCost
+
+resources:
+  - namespace.yaml
+  - alerting
+
+commonLabels:
+  app.kubernetes.io/part-of: observability
+  app.kubernetes.io/managed-by: kustomize

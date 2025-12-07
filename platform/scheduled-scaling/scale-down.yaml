@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-down-night
+  namespace: scheduled-scaling
+spec:
+  schedule: "0 19 * * *"  # 7pm PST
+  timeZone: "America/Los_Angeles"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: cluster-scaler
+          restartPolicy: OnFailure
+          containers:
+            - name: kubectl
+              image: bitnami/kubectl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  echo "Starting scheduled scale-down at $(date)"
+
+                  # ArgoCD - keep 1 of each for overnight syncs
+                  echo "Scaling down argocd to minimums..."
+                  kubectl scale deployment -n argocd argocd-server --replicas=1 || true
+                  kubectl scale deployment -n argocd argocd-repo-server --replicas=1 || true
+                  kubectl scale deployment -n argocd argocd-application-controller --replicas=1 || true
+                  kubectl scale deployment -n argocd argocd-applicationset-controller --replicas=1 || true
+                  kubectl scale deployment -n argocd argocd-notifications-controller --replicas=1 || true
+                  kubectl scale deployment -n argocd argocd-redis --replicas=1 || true
+
+                  # Argo Workflows
+                  echo "Scaling down argo-workflows to minimums..."
+                  kubectl scale deployment -n argo argo-workflows-server --replicas=1 || true
+                  kubectl scale deployment -n argo argo-workflows-workflow-controller --replicas=1 || true
+
+                  # Kyverno - keep admission controller for policy enforcement
+                  echo "Scaling down kyverno to minimums..."
+                  kubectl scale deployment -n kyverno kyverno-admission-controller --replicas=1 || true
+                  kubectl scale deployment -n kyverno kyverno-background-controller --replicas=1 || true
+                  kubectl scale deployment -n kyverno kyverno-cleanup-controller --replicas=1 || true
+                  kubectl scale deployment -n kyverno kyverno-reports-controller --replicas=1 || true
+
+                  # Backstage
+                  echo "Scaling down backstage to minimum..."
+                  kubectl scale deployment -n backstage backstage --replicas=1 || true
+
+                  # Observability - keep 1 for overnight monitoring
+                  echo "Scaling down observability to minimums..."
+                  kubectl scale deployment -n observability --all --replicas=1 || true
+                  kubectl scale statefulset -n observability --all --replicas=1 || true
+
+                  # External Secrets Operator
+                  echo "Scaling down external-secrets to minimums..."
+                  kubectl scale deployment -n external-secrets external-secrets --replicas=1 || true
+                  kubectl scale deployment -n external-secrets external-secrets-webhook --replicas=1 || true
+                  kubectl scale deployment -n external-secrets external-secrets-cert-controller --replicas=1 || true
+
+                  # Cert Manager - keep running for cert renewals
+                  echo "Scaling down cert-manager to minimums..."
+                  kubectl scale deployment -n cert-manager cert-manager --replicas=1 || true
+                  kubectl scale deployment -n cert-manager cert-manager-cainjector --replicas=1 || true
+                  kubectl scale deployment -n cert-manager cert-manager-webhook --replicas=1 || true
+
+                  # AWS Load Balancer Controller
+                  echo "Scaling down aws-load-balancer to minimum..."
+                  kubectl scale deployment -n aws-load-balancer aws-load-balancer-controller --replicas=1 || true
+
+                  # Reloader
+                  echo "Scaling down reloader to minimum..."
+                  kubectl scale deployment -n reloader reloader-reloader --replicas=1 || true
+
+                  # External DNS
+                  echo "Scaling down external-dns to minimum..."
+                  kubectl scale deployment -n external-dns external-dns --replicas=1 || true
+
+                  echo "Scale-down complete at $(date)"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi

@@ -1,0 +1,116 @@
+controller:
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: argo-rollouts
+
+  # Enable features
+  trafficRouterPlugins:
+    # AWS ALB traffic routing
+    alb:
+      enabled: true
+
+dashboard:
+  enabled: true
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internal
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+      alb.ingress.kubernetes.io/ssl-redirect: "443"
+    hosts:
+      - rollouts.internal
+
+# Notifications for rollout events
+notifications:
+  enabled: true
+  secret:
+    create: false
+    name: argo-rollouts-notifications
+  notifiers:
+    service.slack: |
+      token: $slack-token
+
+  triggers:
+    trigger.on-rollout-completed: |
+      - send: [app-deployed]
+    trigger.on-rollout-step-completed: |
+      - send: [rollout-step-completed]
+    trigger.on-analysis-run-failed: |
+      - send: [analysis-failed]
+    trigger.on-rollout-aborted: |
+      - send: [rollout-aborted]
+
+  templates:
+    template.app-deployed: |
+      slack:
+        attachments: |
+          [{
+            "color": "#18be52",
+            "title": "{{.rollout.metadata.name}} deployed",
+            "fields": [
+              {"title": "Namespace", "value": "{{.rollout.metadata.namespace}}", "short": true},
+              {"title": "Revision", "value": "{{.rollout.status.currentPodHash}}", "short": true}
+            ]
+          }]
+    template.rollout-step-completed: |
+      slack:
+        attachments: |
+          [{
+            "color": "#18be52",
+            "title": "Rollout step completed",
+            "fields": [
+              {"title": "Rollout", "value": "{{.rollout.metadata.name}}", "short": true},
+              {"title": "Step", "value": "{{.rollout.status.currentStepIndex}}", "short": true}
+            ]
+          }]
+    template.analysis-failed: |
+      slack:
+        attachments: |
+          [{
+            "color": "#E01E5A",
+            "title": "Analysis failed for {{.rollout.metadata.name}}",
+            "text": "Rollout will be aborted"
+          }]
+    template.rollout-aborted: |
+      slack:
+        attachments: |
+          [{
+            "color": "#E01E5A",
+            "title": "Rollout aborted: {{.rollout.metadata.name}}",
+            "fields": [
+              {"title": "Namespace", "value": "{{.rollout.metadata.namespace}}", "short": true}
+            ]
+          }]
+
+  subscriptions:
+    - recipients:
+        - slack:platform-deployments
+      triggers:
+        - on-rollout-completed
+        - on-rollout-step-completed
+        - on-analysis-run-failed
+        - on-rollout-aborted

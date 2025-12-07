@@ -1,0 +1,39 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-capabilities
+  annotations:
+    policies.kyverno.io/title: Disallow Capabilities
+    policies.kyverno.io/category: Pod Security Standards (Baseline)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Adding capabilities beyond those listed is disallowed. This policy
+      ensures that only permitted capabilities are added.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: adding-capabilities
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - karpenter
+      validate:
+        message: >-
+          Any capabilities added beyond the allowed list (NET_BIND_SERVICE) are disallowed.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.[containers, initContainers, ephemeralContainers][].securityContext.capabilities.add[] }}"
+                operator: AnyNotIn
+                value:
+                  - NET_BIND_SERVICE
+                  - ""

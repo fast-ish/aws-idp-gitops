@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: observability
+
+resources:
+  - prometheus-rules.yaml
+  - alertmanager-config.yaml
+  - cost-alerts.yaml
+  - slo-rules.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: observability
+  app.kubernetes.io/component: alerting

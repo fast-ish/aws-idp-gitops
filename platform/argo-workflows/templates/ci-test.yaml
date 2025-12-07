@@ -1,0 +1,111 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ci-test
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: ci-test
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+spec:
+  entrypoint: test
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+  podGC:
+    strategy: OnWorkflowSuccess
+    deleteDelayDuration: 5m
+
+  arguments:
+    parameters:
+      - name: repo-url
+        description: Git repository URL
+      - name: revision
+        description: Git revision (branch, tag, or commit SHA)
+        default: main
+      - name: test-image
+        description: Image to use for running tests
+        default: node:20-alpine
+      - name: test-command
+        description: Command to run tests
+        default: "npm ci && npm test"
+
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+
+  templates:
+    - name: test
+      dag:
+        tasks:
+          - name: clone
+            template: git-clone
+            arguments:
+              parameters:
+                - name: repo-url
+                  value: "{{workflow.parameters.repo-url}}"
+                - name: revision
+                  value: "{{workflow.parameters.revision}}"
+
+          - name: run-tests
+            template: run-tests
+            dependencies: [clone]
+            arguments:
+              parameters:
+                - name: test-image
+                  value: "{{workflow.parameters.test-image}}"
+                - name: test-command
+                  value: "{{workflow.parameters.test-command}}"
+
+    - name: git-clone
+      inputs:
+        parameters:
+          - name: repo-url
+          - name: revision
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            git clone --depth 1 --branch {{inputs.parameters.revision}} \
+              {{inputs.parameters.repo-url}} /work/src
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: run-tests
+      inputs:
+        parameters:
+          - name: test-image
+          - name: test-command
+      container:
+        image: "{{inputs.parameters.test-image}}"
+        command: [sh, -c]
+        args:
+          - |
+            cd /work/src
+            {{inputs.parameters.test-command}}
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi

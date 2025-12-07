@@ -1,0 +1,111 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: success-rate
+    app.kubernetes.io/component: analysis-template
+    app.kubernetes.io/part-of: argo-rollouts
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+    - name: threshold
+      value: "0.95"
+  metrics:
+    - name: success-rate
+      interval: 30s
+      count: 10
+      successCondition: result[0] >= {{args.threshold}}
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.observability.svc.cluster.local:9090
+          query: |
+            sum(rate(
+              http_requests_total{
+                service="{{args.service-name}}",
+                namespace="{{args.namespace}}",
+                status!~"5.."
+              }[5m]
+            )) /
+            sum(rate(
+              http_requests_total{
+                service="{{args.service-name}}",
+                namespace="{{args.namespace}}"
+              }[5m]
+            ))
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: latency-p99
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: latency-p99
+    app.kubernetes.io/component: analysis-template
+    app.kubernetes.io/part-of: argo-rollouts
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+    - name: threshold-ms
+      value: "500"
+  metrics:
+    - name: latency-p99
+      interval: 30s
+      count: 10
+      successCondition: result[0] < {{args.threshold-ms}}
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.observability.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(
+                http_request_duration_seconds_bucket{
+                  service="{{args.service-name}}",
+                  namespace="{{args.namespace}}"
+                }[5m]
+              )) by (le)
+            ) * 1000
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: error-rate
+    app.kubernetes.io/component: analysis-template
+    app.kubernetes.io/part-of: argo-rollouts
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+    - name: threshold
+      value: "0.01"
+  metrics:
+    - name: error-rate
+      interval: 30s
+      count: 10
+      successCondition: result[0] <= {{args.threshold}}
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.observability.svc.cluster.local:9090
+          query: |
+            sum(rate(
+              http_requests_total{
+                service="{{args.service-name}}",
+                namespace="{{args.namespace}}",
+                status=~"5.."
+              }[5m]
+            )) /
+            sum(rate(
+              http_requests_total{
+                service="{{args.service-name}}",
+                namespace="{{args.namespace}}"
+              }[5m]
+            ))

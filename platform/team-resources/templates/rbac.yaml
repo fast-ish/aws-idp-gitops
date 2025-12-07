@@ -1,0 +1,81 @@
+# ServiceAccount for team workloads
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.team.name }}-workload
+  namespace: {{ .Values.team.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.team.name }}
+    app.kubernetes.io/component: service-account
+    team: {{ .Values.team.name }}
+---
+# Role for team members to manage their namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.team.name }}-developer
+  namespace: {{ .Values.team.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.team.name }}
+    app.kubernetes.io/component: role
+    team: {{ .Values.team.name }}
+rules:
+  # Full access to workloads
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Full access to pods
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/exec", "pods/portforward"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Full access to services
+  - apiGroups: [""]
+    resources: ["services", "endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Full access to configmaps and secrets
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Full access to PVCs
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Full access to ingresses
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Full access to jobs and cronjobs
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Full access to HPA
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only access to events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Read-only access to resource quotas
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch"]
+  # Access to service accounts within namespace
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+# Read-only role for team observers
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.team.name }}-viewer
+  namespace: {{ .Values.team.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.team.name }}
+    app.kubernetes.io/component: role
+    team: {{ .Values.team.name }}
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io", "autoscaling"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]

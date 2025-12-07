@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-up-morning
+  namespace: scheduled-scaling
+spec:
+  schedule: "0 6 * * 1-5"  # 6am PST Mon-Fri
+  timeZone: "America/Los_Angeles"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: cluster-scaler
+          restartPolicy: OnFailure
+          containers:
+            - name: kubectl
+              image: bitnami/kubectl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  echo "Starting scheduled scale-up at $(date)"
+
+                  # Cert Manager
+                  echo "Scaling up cert-manager..."
+                  kubectl scale deployment -n cert-manager cert-manager --replicas=1 || true
+                  kubectl scale deployment -n cert-manager cert-manager-cainjector --replicas=1 || true
+                  kubectl scale deployment -n cert-manager cert-manager-webhook --replicas=1 || true
+
+                  # External Secrets Operator
+                  echo "Scaling up external-secrets..."
+                  kubectl scale deployment -n external-secrets external-secrets --replicas=1 || true
+                  kubectl scale deployment -n external-secrets external-secrets-webhook --replicas=1 || true
+                  kubectl scale deployment -n external-secrets external-secrets-cert-controller --replicas=1 || true
+
+                  # AWS Load Balancer Controller
+                  echo "Scaling up aws-load-balancer..."
+                  kubectl scale deployment -n aws-load-balancer aws-load-balancer-controller --replicas=2 || true
+
+                  # External DNS
+                  echo "Scaling up external-dns..."
+                  kubectl scale deployment -n external-dns external-dns --replicas=1 || true
+
+                  # Reloader
+                  echo "Scaling up reloader..."
+                  kubectl scale deployment -n reloader reloader-reloader --replicas=1 || true
+
+                  # Kyverno
+                  echo "Scaling up kyverno..."
+                  kubectl scale deployment -n kyverno kyverno-admission-controller --replicas=3 || true
+                  kubectl scale deployment -n kyverno kyverno-background-controller --replicas=2 || true
+                  kubectl scale deployment -n kyverno kyverno-cleanup-controller --replicas=2 || true
+                  kubectl scale deployment -n kyverno kyverno-reports-controller --replicas=2 || true
+
+                  # Observability
+                  echo "Scaling up observability..."
+                  kubectl scale deployment -n observability --all --replicas=2 || true
+                  kubectl scale statefulset -n observability --all --replicas=1 || true
+
+                  # ArgoCD
+                  echo "Scaling up argocd..."
+                  kubectl scale deployment -n argocd argocd-server --replicas=2 || true
+                  kubectl scale deployment -n argocd argocd-repo-server --replicas=2 || true
+                  kubectl scale deployment -n argocd argocd-application-controller --replicas=2 || true
+                  kubectl scale deployment -n argocd argocd-applicationset-controller --replicas=2 || true
+                  kubectl scale deployment -n argocd argocd-notifications-controller --replicas=1 || true
+                  kubectl scale deployment -n argocd argocd-redis --replicas=1 || true
+
+                  # Argo Workflows
+                  echo "Scaling up argo-workflows..."
+                  kubectl scale deployment -n argo argo-workflows-server --replicas=2 || true
+                  kubectl scale deployment -n argo argo-workflows-workflow-controller --replicas=2 || true
+
+                  # Backstage
+                  echo "Scaling up backstage..."
+                  kubectl scale deployment -n backstage backstage --replicas=2 || true
+
+                  echo "Scale-up complete at $(date)"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi

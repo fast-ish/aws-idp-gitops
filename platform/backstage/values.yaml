@@ -1,0 +1,174 @@
+# Backstage Helm Chart Values
+# https://github.com/backstage/charts/tree/main/charts/backstage
+
+# Note: This deploys the upstream Backstage image. For production,
+# you should build and deploy your customized backstage-ext image.
+
+backstage:
+  replicas: 2
+
+  image:
+    # Use your custom Backstage image built from backstage-ext
+    registry: ${ECR_REGISTRY}
+    repository: backstage
+    tag: latest
+    pullPolicy: Always
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+
+  extraEnvVars:
+    - name: APP_CONFIG_app_baseUrl
+      value: "https://backstage.internal"
+    - name: APP_CONFIG_backend_baseUrl
+      value: "https://backstage.internal"
+    - name: APP_CONFIG_backend_cors_origin
+      value: "https://backstage.internal"
+
+  extraEnvVarsSecrets:
+    - backstage-secrets
+
+  appConfig:
+    app:
+      title: Developer Portal
+      baseUrl: https://backstage.internal
+
+    backend:
+      baseUrl: https://backstage.internal
+      listen:
+        port: 7007
+      csp:
+        connect-src: ["'self'", 'http:', 'https:']
+      cors:
+        origin: https://backstage.internal
+        methods: [GET, HEAD, PATCH, POST, PUT, DELETE]
+        credentials: true
+      database:
+        client: pg
+        connection:
+          host: ${POSTGRES_HOST}
+          port: 5432
+          user: ${POSTGRES_USER}
+          password: ${POSTGRES_PASSWORD}
+
+    integrations:
+      github:
+        - host: github.com
+          token: ${GITHUB_TOKEN}
+
+    auth:
+      environment: production
+      providers:
+        github:
+          production:
+            clientId: ${AUTH_GITHUB_CLIENT_ID}
+            clientSecret: ${AUTH_GITHUB_CLIENT_SECRET}
+
+    catalog:
+      import:
+        entityFilename: catalog-info.yaml
+        pullRequestBranchName: backstage-integration
+      rules:
+        - allow: [Component, System, API, Resource, Location, Domain, Group, User, Template]
+      locations:
+        - type: url
+          target: https://github.com/fast-ish/aws-idp-gitops/blob/main/platform/backstage/templates-location.yaml
+          rules:
+            - allow: [Location, Template]
+
+    kubernetes:
+      serviceLocatorMethod:
+        type: multiTenant
+      clusterLocatorMethods:
+        - type: config
+          clusters:
+            - url: ${KUBERNETES_API_URL}
+              name: production
+              authProvider: serviceAccount
+              serviceAccountToken: ${KUBERNETES_SA_TOKEN}
+              skipTLSVerify: false
+      customResources:
+        - group: argoproj.io
+          apiVersion: v1alpha1
+          plural: rollouts
+        - group: argoproj.io
+          apiVersion: v1alpha1
+          plural: analysisruns
+        - group: argoproj.io
+          apiVersion: v1alpha1
+          plural: workflows
+
+    argocd:
+      appLocatorMethods:
+        - type: config
+          instances:
+            - name: production
+              url: ${ARGOCD_URL}
+              token: ${ARGOCD_AUTH_TOKEN}
+
+    argoWorkflows:
+      baseUrl: ${ARGO_WORKFLOWS_URL}
+
+    permission:
+      enabled: true
+
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop:
+        - ALL
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+  host: backstage.internal
+  tls:
+    enabled: true
+    secretName: backstage-tls
+
+postgresql:
+  enabled: true
+  auth:
+    username: backstage
+    password: ""  # Use existing secret
+    existingSecret: backstage-db-credentials
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+  primary:
+    persistence:
+      enabled: true
+      storageClass: gp3
+      size: 10Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+serviceAccount:
+  create: true
+  name: backstage
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::${AWS_ACCOUNT_ID}:role/backstage-role
+
+metrics:
+  serviceMonitor:
+    enabled: true
+    namespace: observability

@@ -1,0 +1,55 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+  annotations:
+    policies.kyverno.io/title: Restrict Image Registries
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Restricts container images to trusted registries only.
+      Team namespaces can only use images from ECR or approved public registries.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: validate-registries
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - "team-*"
+      validate:
+        message: >-
+          Images must come from approved registries:
+          - ECR: *.dkr.ecr.*.amazonaws.com/*
+          - GHCR: ghcr.io/*
+        pattern:
+          spec:
+            containers:
+              - image: "*.dkr.ecr.*.amazonaws.com/* | ghcr.io/*"
+            =(initContainers):
+              - image: "*.dkr.ecr.*.amazonaws.com/* | ghcr.io/*"
+
+    - name: exclude-system-namespaces
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - kube-system
+                - karpenter
+                - argocd
+                - argo
+                - external-secrets
+                - kyverno
+                - observability
+                - falco
+                - trivy-system
+      validate:
+        message: "System namespaces are exempt from registry restrictions"
+        deny: {}

@@ -1,0 +1,41 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-host-ports
+  annotations:
+    policies.kyverno.io/title: Disallow Host Ports
+    policies.kyverno.io/category: Pod Security Standards (Baseline)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Access to host ports allows potential snooping of network traffic and should
+      not be allowed. This policy ensures no hostPort is specified.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: host-ports
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - karpenter
+      validate:
+        message: "Use of host ports is disallowed."
+        pattern:
+          spec:
+            =(initContainers):
+              - =(ports):
+                  - =(hostPort): "<=0"
+            containers:
+              - =(ports):
+                  - =(hostPort): "<=0"
+            =(ephemeralContainers):
+              - =(ports):
+                  - =(hostPort): "<=0"

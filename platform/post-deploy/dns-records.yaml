@@ -1,0 +1,128 @@
+# DNS Records for external-dns
+# These Ingress resources configure external-dns to create Route53 records
+# for Backstage, ArgoCD, and Argo Workflows using the wildcard ACM certificate
+#
+# NOTE: The certificate ARN is discovered automatically by AWS Load Balancer Controller
+# when using the host-based TLS configuration. The wildcard cert (*.backstage.stxkxs.io)
+# is matched based on the Ingress host rules.
+#
+# If explicit certificate ARN is needed, it can be obtained from:
+#   aws acm list-certificates --query "CertificateSummaryList[?DomainName=='*.backstage.stxkxs.io'].CertificateArn"
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backstage
+  namespace: backstage
+  labels:
+    app.kubernetes.io/name: backstage
+    app.kubernetes.io/component: ingress
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # Auto-discover certificate from ACM based on host
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/group.name: backstage-platform
+    alb.ingress.kubernetes.io/group.order: "1"
+    alb.ingress.kubernetes.io/healthcheck-path: /healthcheck
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    external-dns.alpha.kubernetes.io/hostname: backstage.stxkxs.io
+    external-dns.alpha.kubernetes.io/ttl: "300"
+spec:
+  ingressClassName: alb
+  tls:
+    - hosts:
+        - backstage.stxkxs.io
+  rules:
+    - host: backstage.stxkxs.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: oyster-backstage
+                port:
+                  number: 7007
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-server
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd
+    app.kubernetes.io/component: ingress
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/group.name: backstage-platform
+    alb.ingress.kubernetes.io/group.order: "2"
+    # ArgoCD server runs HTTPS internally
+    alb.ingress.kubernetes.io/backend-protocol: HTTPS
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTPS
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    external-dns.alpha.kubernetes.io/hostname: argocd.backstage.stxkxs.io
+    external-dns.alpha.kubernetes.io/ttl: "300"
+spec:
+  ingressClassName: alb
+  tls:
+    - hosts:
+        - argocd.backstage.stxkxs.io
+  rules:
+    - host: argocd.backstage.stxkxs.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argo-workflows-server
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: argo-workflows
+    app.kubernetes.io/component: ingress
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/group.name: backstage-platform
+    alb.ingress.kubernetes.io/group.order: "3"
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    external-dns.alpha.kubernetes.io/hostname: workflows.backstage.stxkxs.io
+    external-dns.alpha.kubernetes.io/ttl: "300"
+spec:
+  ingressClassName: alb
+  tls:
+    - hosts:
+        - workflows.backstage.stxkxs.io
+  rules:
+    - host: workflows.backstage.stxkxs.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argo-workflows-server
+                port:
+                  number: 2746

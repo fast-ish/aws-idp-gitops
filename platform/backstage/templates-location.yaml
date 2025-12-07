@@ -1,0 +1,29 @@
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: golden-path-templates
+  description: Golden path templates for self-service project creation
+spec:
+  type: url
+  targets:
+    - https://github.com/fast-ish/java-service-template/blob/main/template.yaml
+    - https://github.com/fast-ish/python-service-template/blob/main/template.yaml
+    - https://github.com/fast-ish/rails-api-template/blob/main/template.yaml
+    - https://github.com/fast-ish/react-frontend-template/blob/main/template.yaml
+    - https://github.com/fast-ish/data-pipeline-template/blob/main/template.yaml
+    - https://github.com/fast-ish/team-onboarding-template/blob/main/template.yaml
+---
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: golden-path-catalog-info
+  description: Catalog info for golden path templates
+spec:
+  type: url
+  targets:
+    - https://github.com/fast-ish/java-service-template/blob/main/catalog-info.yaml
+    - https://github.com/fast-ish/python-service-template/blob/main/catalog-info.yaml
+    - https://github.com/fast-ish/rails-api-template/blob/main/catalog-info.yaml
+    - https://github.com/fast-ish/react-frontend-template/blob/main/catalog-info.yaml
+    - https://github.com/fast-ish/data-pipeline-template/blob/main/catalog-info.yaml
+    - https://github.com/fast-ish/team-onboarding-template/blob/main/catalog-info.yaml

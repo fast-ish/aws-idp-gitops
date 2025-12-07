@@ -1,0 +1,124 @@
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: github-webhook
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: github-webhook
+    app.kubernetes.io/component: event-source
+    app.kubernetes.io/part-of: argo-events
+spec:
+  eventBusName: default
+  github:
+    # Push events trigger CI
+    push:
+      repositories:
+        - owner: fast-ish
+          names:
+            - "*"
+      webhook:
+        endpoint: /push
+        port: "12000"
+        method: POST
+        url: https://events.internal
+      events:
+        - push
+      apiToken:
+        name: github-token
+        key: token
+      webhookSecret:
+        name: github-webhook-secret
+        key: secret
+      insecure: false
+      active: true
+      contentType: json
+
+    # Pull request events for preview environments
+    pull-request:
+      repositories:
+        - owner: fast-ish
+          names:
+            - "*"
+      webhook:
+        endpoint: /pull-request
+        port: "12000"
+        method: POST
+        url: https://events.internal
+      events:
+        - pull_request
+      apiToken:
+        name: github-token
+        key: token
+      webhookSecret:
+        name: github-webhook-secret
+        key: secret
+      insecure: false
+      active: true
+      contentType: json
+
+    # Release events for production deployments
+    release:
+      repositories:
+        - owner: fast-ish
+          names:
+            - "*"
+      webhook:
+        endpoint: /release
+        port: "12000"
+        method: POST
+        url: https://events.internal
+      events:
+        - release
+      apiToken:
+        name: github-token
+        key: token
+      webhookSecret:
+        name: github-webhook-secret
+        key: secret
+      insecure: false
+      active: true
+      contentType: json
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-webhook-eventsource
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: github-webhook-eventsource
+    app.kubernetes.io/component: event-source-service
+    app.kubernetes.io/part-of: argo-events
+spec:
+  ports:
+    - port: 12000
+      targetPort: 12000
+  selector:
+    eventsource-name: github-webhook
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: github-webhook-eventsource
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: github-webhook-eventsource
+    app.kubernetes.io/component: event-source-ingress
+    app.kubernetes.io/part-of: argo-events
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+spec:
+  ingressClassName: alb
+  rules:
+    - host: events.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: github-webhook-eventsource
+                port:
+                  number: 12000

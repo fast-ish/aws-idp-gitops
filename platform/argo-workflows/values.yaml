@@ -1,0 +1,157 @@
+# Argo Workflows Helm Chart Values
+# https://github.com/argoproj/argo-helm/tree/main/charts/argo-workflows
+
+# Controller configuration
+controller:
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  metricsConfig:
+    enabled: true
+
+  serviceMonitor:
+    enabled: true
+    namespace: observability
+
+  # Workflow defaults
+  workflowDefaults:
+    spec:
+      ttlStrategy:
+        secondsAfterCompletion: 86400  # 1 day
+        secondsAfterSuccess: 43200     # 12 hours
+        secondsAfterFailure: 172800    # 2 days
+      podGC:
+        strategy: OnPodCompletion
+        deleteDelayDuration: 5m
+
+  # Archive configuration
+  persistence:
+    archive: true
+    postgresql:
+      host: argo-workflows-postgresql
+      port: 5432
+      database: argo_workflows
+      tableName: argo_workflows
+      userNameSecret:
+        name: argo-workflows-db
+        key: username
+      passwordSecret:
+        name: argo-workflows-db
+        key: password
+
+  # Namespace installation mode
+  namespaceParallelism: 10
+
+  # Priority class
+  priorityClassName: system-cluster-critical
+
+# Server configuration
+server:
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  extraArgs:
+    - --auth-mode=sso
+
+  # SSO configuration (GitHub OAuth)
+  sso:
+    enabled: true
+    issuer: https://github.com/login/oauth/authorize
+    clientId:
+      name: argo-workflows-sso
+      key: client-id
+    clientSecret:
+      name: argo-workflows-sso
+      key: client-secret
+    redirectUrl: https://workflows.internal/oauth2/callback
+    scopes:
+      - user:email
+      - read:org
+    rbac:
+      enabled: true
+
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    hosts:
+      - workflows.internal
+    tls:
+      - secretName: argo-workflows-server-tls
+        hosts:
+          - workflows.internal
+
+  serviceMonitor:
+    enabled: true
+    namespace: observability
+
+# Executor configuration
+executor:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Use emissary executor for better security
+useDefaultArtifactRepo: true
+artifactRepository:
+  archiveLogs: true
+  s3:
+    bucket: ${ARTIFACT_BUCKET}
+    region: us-west-2
+    endpoint: s3.amazonaws.com
+    insecure: false
+    accessKeySecret:
+      name: argo-workflows-s3
+      key: accessKey
+    secretKeySecret:
+      name: argo-workflows-s3
+      key: secretKey
+
+# Workflow RBAC
+workflow:
+  serviceAccount:
+    create: true
+    name: argo-workflow
+  rbac:
+    create: true
+
+# Create ClusterRole for workflows
+createAggregateRoles: true
+
+# Main container customization
+mainContainer:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true

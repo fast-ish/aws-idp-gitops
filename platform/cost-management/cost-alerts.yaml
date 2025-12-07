@@ -1,0 +1,112 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubecost-alerts
+  namespace: kubecost
+  labels:
+    app.kubernetes.io/name: kubecost-alerts
+    app.kubernetes.io/part-of: cost-management
+spec:
+  groups:
+    - name: cost.alerts
+      interval: 5m
+      rules:
+        # Team budget exceeded
+        - alert: TeamBudgetExceeded
+          expr: |
+            sum by (namespace) (
+              kubecost_namespace_cost_month_to_date{namespace=~"team-.*"}
+            ) > 500
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Team {{ $labels.namespace }} exceeded monthly budget"
+            description: "Current month-to-date spend: ${{ $value | printf \"%.2f\" }}"
+
+        # Cost spike detection
+        - alert: UnexpectedCostSpike
+          expr: |
+            (
+              sum(kubecost_cluster_costs) -
+              sum(kubecost_cluster_costs offset 1d)
+            ) / sum(kubecost_cluster_costs offset 1d) > 0.25
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: "25% cost increase detected"
+            description: "Cluster costs increased by {{ $value | humanizePercentage }} compared to yesterday"
+
+        # High idle cost
+        - alert: HighIdleCost
+          expr: |
+            sum(kubecost_cluster_idle_costs) / sum(kubecost_cluster_costs) > 0.35
+          for: 24h
+          labels:
+            severity: info
+          annotations:
+            summary: "High idle cost detected ({{ $value | humanizePercentage }})"
+            description: "Consider right-sizing workloads or consolidating resources"
+
+        # Namespace cost anomaly
+        - alert: NamespaceCostAnomaly
+          expr: |
+            (
+              kubecost_namespace_cost_day_to_date -
+              avg_over_time(kubecost_namespace_cost_day_to_date[7d])
+            ) / avg_over_time(kubecost_namespace_cost_day_to_date[7d]) > 0.5
+          for: 4h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Cost anomaly in namespace {{ $labels.namespace }}"
+            description: "Daily cost is 50% higher than 7-day average"
+
+        # Underutilized resources
+        - alert: LowCPUEfficiency
+          expr: |
+            sum by (namespace) (
+              rate(container_cpu_usage_seconds_total{namespace=~"team-.*"}[1h])
+            ) / sum by (namespace) (
+              container_spec_cpu_quota{namespace=~"team-.*"} / container_spec_cpu_period
+            ) < 0.3
+          for: 24h
+          labels:
+            severity: info
+          annotations:
+            summary: "Low CPU efficiency in {{ $labels.namespace }}"
+            description: "CPU utilization is below 30%. Consider reducing CPU requests."
+
+        - alert: LowMemoryEfficiency
+          expr: |
+            sum by (namespace) (
+              container_memory_working_set_bytes{namespace=~"team-.*"}
+            ) / sum by (namespace) (
+              container_spec_memory_limit_bytes{namespace=~"team-.*"}
+            ) < 0.4
+          for: 24h
+          labels:
+            severity: info
+          annotations:
+            summary: "Low memory efficiency in {{ $labels.namespace }}"
+            description: "Memory utilization is below 40%. Consider reducing memory limits."
+
+        # Spot instance opportunities
+        - alert: SpotInstanceOpportunity
+          expr: |
+            sum by (namespace) (
+              kubecost_namespace_cost_month_to_date{namespace=~"team-.*"} *
+              on() group_left() (
+                count(kube_pod_info{node=~".*spot.*"}) /
+                count(kube_pod_info)
+              )
+            ) / sum by (namespace) (
+              kubecost_namespace_cost_month_to_date{namespace=~"team-.*"}
+            ) < 0.3
+          for: 7d
+          labels:
+            severity: info
+          annotations:
+            summary: "Spot instance opportunity in {{ $labels.namespace }}"
+            description: "Less than 30% of workloads running on spot instances"

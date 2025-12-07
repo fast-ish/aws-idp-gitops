@@ -1,0 +1,300 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: deploy-kubernetes
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: deploy-kubernetes
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+  annotations:
+    description: |
+      Deploy an application to Kubernetes using kubectl.
+      Supports rolling updates, rollbacks, and health checks.
+spec:
+  entrypoint: deploy
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+  podGC:
+    strategy: OnWorkflowSuccess
+    deleteDelayDuration: 5m
+
+  arguments:
+    parameters:
+      - name: deployment-name
+        description: Name of the Kubernetes Deployment
+      - name: namespace
+        default: default
+        description: Target Kubernetes namespace
+      - name: image
+        description: Full image reference (registry/image:tag)
+      - name: container-name
+        default: app
+        description: Container name within the deployment
+      - name: replicas
+        default: "2"
+        description: Desired number of replicas
+      - name: wait-timeout
+        default: "300"
+        description: Timeout in seconds to wait for rollout
+      - name: dry-run
+        default: "false"
+        description: Perform a dry run without applying changes
+
+  templates:
+    - name: deploy
+      steps:
+        - - name: pre-check
+            template: verify-deployment-exists
+            arguments:
+              parameters:
+                - name: deployment-name
+                  value: "{{workflow.parameters.deployment-name}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+
+        - - name: backup-current
+            template: get-current-image
+            arguments:
+              parameters:
+                - name: deployment-name
+                  value: "{{workflow.parameters.deployment-name}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+                - name: container-name
+                  value: "{{workflow.parameters.container-name}}"
+
+        - - name: update-image
+            template: set-image
+            arguments:
+              parameters:
+                - name: deployment-name
+                  value: "{{workflow.parameters.deployment-name}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+                - name: container-name
+                  value: "{{workflow.parameters.container-name}}"
+                - name: image
+                  value: "{{workflow.parameters.image}}"
+                - name: dry-run
+                  value: "{{workflow.parameters.dry-run}}"
+
+        - - name: scale
+            template: scale-deployment
+            when: "{{workflow.parameters.dry-run}} == false"
+            arguments:
+              parameters:
+                - name: deployment-name
+                  value: "{{workflow.parameters.deployment-name}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+                - name: replicas
+                  value: "{{workflow.parameters.replicas}}"
+
+        - - name: wait-rollout
+            template: rollout-status
+            when: "{{workflow.parameters.dry-run}} == false"
+            arguments:
+              parameters:
+                - name: deployment-name
+                  value: "{{workflow.parameters.deployment-name}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+                - name: timeout
+                  value: "{{workflow.parameters.wait-timeout}}"
+
+        - - name: verify
+            template: verify-health
+            when: "{{workflow.parameters.dry-run}} == false"
+            arguments:
+              parameters:
+                - name: deployment-name
+                  value: "{{workflow.parameters.deployment-name}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+
+    - name: verify-deployment-exists
+      inputs:
+        parameters:
+          - name: deployment-name
+          - name: namespace
+      container:
+        image: bitnami/kubectl:1.29
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Checking deployment {{inputs.parameters.deployment-name}} in {{inputs.parameters.namespace}}..."
+            kubectl get deployment {{inputs.parameters.deployment-name}} \
+              -n {{inputs.parameters.namespace}} \
+              -o jsonpath='{.metadata.name}'
+            echo ""
+            echo "Deployment found."
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+
+    - name: get-current-image
+      inputs:
+        parameters:
+          - name: deployment-name
+          - name: namespace
+          - name: container-name
+      outputs:
+        parameters:
+          - name: current-image
+            valueFrom:
+              path: /tmp/current-image
+      container:
+        image: bitnami/kubectl:1.29
+        command: [sh, -c]
+        args:
+          - |
+            kubectl get deployment {{inputs.parameters.deployment-name}} \
+              -n {{inputs.parameters.namespace}} \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="{{inputs.parameters.container-name}}")].image}' \
+              > /tmp/current-image
+            echo "Current image: $(cat /tmp/current-image)"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+
+    - name: set-image
+      inputs:
+        parameters:
+          - name: deployment-name
+          - name: namespace
+          - name: container-name
+          - name: image
+          - name: dry-run
+      container:
+        image: bitnami/kubectl:1.29
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            DRY_RUN_FLAG=""
+            if [ "{{inputs.parameters.dry-run}}" = "true" ]; then
+              DRY_RUN_FLAG="--dry-run=client"
+              echo "DRY RUN MODE"
+            fi
+
+            echo "Setting image {{inputs.parameters.image}} on container {{inputs.parameters.container-name}}..."
+            kubectl set image deployment/{{inputs.parameters.deployment-name}} \
+              {{inputs.parameters.container-name}}={{inputs.parameters.image}} \
+              -n {{inputs.parameters.namespace}} \
+              $DRY_RUN_FLAG
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+
+    - name: scale-deployment
+      inputs:
+        parameters:
+          - name: deployment-name
+          - name: namespace
+          - name: replicas
+      container:
+        image: bitnami/kubectl:1.29
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            CURRENT=$(kubectl get deployment {{inputs.parameters.deployment-name}} \
+              -n {{inputs.parameters.namespace}} \
+              -o jsonpath='{.spec.replicas}')
+
+            if [ "$CURRENT" != "{{inputs.parameters.replicas}}" ]; then
+              echo "Scaling from $CURRENT to {{inputs.parameters.replicas}} replicas..."
+              kubectl scale deployment {{inputs.parameters.deployment-name}} \
+                --replicas={{inputs.parameters.replicas}} \
+                -n {{inputs.parameters.namespace}}
+            else
+              echo "Already at {{inputs.parameters.replicas}} replicas"
+            fi
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+
+    - name: rollout-status
+      inputs:
+        parameters:
+          - name: deployment-name
+          - name: namespace
+          - name: timeout
+      container:
+        image: bitnami/kubectl:1.29
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Waiting for rollout to complete..."
+            kubectl rollout status deployment/{{inputs.parameters.deployment-name}} \
+              -n {{inputs.parameters.namespace}} \
+              --timeout={{inputs.parameters.timeout}}s
+            echo "Rollout complete!"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+
+    - name: verify-health
+      inputs:
+        parameters:
+          - name: deployment-name
+          - name: namespace
+      container:
+        image: bitnami/kubectl:1.29
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Verifying deployment health..."
+
+            READY=$(kubectl get deployment {{inputs.parameters.deployment-name}} \
+              -n {{inputs.parameters.namespace}} \
+              -o jsonpath='{.status.readyReplicas}')
+            DESIRED=$(kubectl get deployment {{inputs.parameters.deployment-name}} \
+              -n {{inputs.parameters.namespace}} \
+              -o jsonpath='{.spec.replicas}')
+
+            echo "Ready: $READY / Desired: $DESIRED"
+
+            if [ "$READY" != "$DESIRED" ]; then
+              echo "ERROR: Not all replicas are ready!"
+              kubectl get pods -n {{inputs.parameters.namespace}} \
+                -l app={{inputs.parameters.deployment-name}} \
+                -o wide
+              exit 1
+            fi
+
+            echo "Deployment healthy!"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi

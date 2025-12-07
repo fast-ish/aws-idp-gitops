@@ -1,0 +1,167 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: alertmanager-config
+    app.kubernetes.io/part-of: observability
+stringData:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+      slack_api_url_file: /etc/alertmanager/secrets/slack-webhook-url
+
+    route:
+      group_by: ['alertname', 'namespace', 'severity']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: 'default-receiver'
+      routes:
+        # Critical alerts go to PagerDuty
+        - receiver: 'pagerduty-critical'
+          match:
+            severity: critical
+          continue: true
+
+        # Platform team alerts
+        - receiver: 'slack-platform'
+          match:
+            team: platform
+          continue: true
+
+        # Security team alerts
+        - receiver: 'slack-security'
+          match:
+            team: security
+          continue: true
+
+        # Team-specific routing based on namespace
+        - receiver: 'slack-team-backend'
+          match_re:
+            namespace: 'team-backend'
+
+        - receiver: 'slack-team-frontend'
+          match_re:
+            namespace: 'team-frontend'
+
+        - receiver: 'slack-team-data'
+          match_re:
+            namespace: 'team-data'
+
+    receivers:
+      - name: 'default-receiver'
+        slack_configs:
+          - channel: '#platform-alerts'
+            send_resolved: true
+            title: '{{ template "slack.title" . }}'
+            text: '{{ template "slack.text" . }}'
+            actions:
+              - type: button
+                text: 'Runbook'
+                url: '{{ (index .Alerts 0).Annotations.runbook_url }}'
+              - type: button
+                text: 'Grafana'
+                url: 'https://grafana.internal/d/alerts'
+
+      - name: 'pagerduty-critical'
+        pagerduty_configs:
+          - service_key_file: /etc/alertmanager/secrets/pagerduty-key
+            severity: critical
+            description: '{{ .GroupLabels.alertname }}'
+            details:
+              firing: '{{ template "pagerduty.firing" . }}'
+              num_firing: '{{ .Alerts.Firing | len }}'
+              num_resolved: '{{ .Alerts.Resolved | len }}'
+
+      - name: 'slack-platform'
+        slack_configs:
+          - channel: '#platform-alerts'
+            send_resolved: true
+            title: '[Platform] {{ .GroupLabels.alertname }}'
+            text: '{{ template "slack.text" . }}'
+            color: '{{ template "slack.color" . }}'
+
+      - name: 'slack-security'
+        slack_configs:
+          - channel: '#security-alerts'
+            send_resolved: true
+            title: '[Security] {{ .GroupLabels.alertname }}'
+            text: '{{ template "slack.text" . }}'
+            color: '{{ template "slack.color" . }}'
+
+      - name: 'slack-team-backend'
+        slack_configs:
+          - channel: '#backend-alerts'
+            send_resolved: true
+            title: '{{ template "slack.title" . }}'
+            text: '{{ template "slack.text" . }}'
+
+      - name: 'slack-team-frontend'
+        slack_configs:
+          - channel: '#frontend-alerts'
+            send_resolved: true
+            title: '{{ template "slack.title" . }}'
+            text: '{{ template "slack.text" . }}'
+
+      - name: 'slack-team-data'
+        slack_configs:
+          - channel: '#data-alerts'
+            send_resolved: true
+            title: '{{ template "slack.title" . }}'
+            text: '{{ template "slack.text" . }}'
+
+    inhibit_rules:
+      # Inhibit warning alerts if critical alert is firing
+      - source_match:
+          severity: 'critical'
+        target_match:
+          severity: 'warning'
+        equal: ['alertname', 'namespace']
+
+      # Inhibit all alerts for a namespace if namespace is being terminated
+      - source_match:
+          alertname: 'NamespaceTerminating'
+        target_match_re:
+          namespace: '.+'
+        equal: ['namespace']
+
+    templates:
+      - '/etc/alertmanager/templates/*.tmpl'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-templates
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: alertmanager-templates
+    app.kubernetes.io/part-of: observability
+data:
+  slack.tmpl: |
+    {{ define "slack.title" }}
+    [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .GroupLabels.alertname }}
+    {{ end }}
+
+    {{ define "slack.text" }}
+    {{ range .Alerts }}
+    *Alert:* {{ .Labels.alertname }}{{ if .Labels.severity }} - `{{ .Labels.severity }}`{{ end }}
+    *Namespace:* {{ .Labels.namespace }}
+    *Summary:* {{ .Annotations.summary }}
+    *Description:* {{ .Annotations.description }}
+    {{ end }}
+    {{ end }}
+
+    {{ define "slack.color" }}
+    {{ if eq .Status "firing" }}
+    {{ if eq (index .Alerts 0).Labels.severity "critical" }}danger{{ else }}warning{{ end }}
+    {{ else }}good{{ end }}
+    {{ end }}
+
+  pagerduty.tmpl: |
+    {{ define "pagerduty.firing" }}
+    {{ range .Alerts.Firing }}
+    - {{ .Labels.alertname }}: {{ .Annotations.summary }}
+    {{ end }}
+    {{ end }}

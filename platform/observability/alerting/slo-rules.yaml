@@ -1,0 +1,356 @@
+# =============================================================================
+# SLO Recording Rules and Alerts
+# Based on Google SRE principles and the Four Golden Signals
+# =============================================================================
+# Golden Signals:
+# 1. Latency - How long requests take
+# 2. Traffic - How much demand is on the system
+# 3. Errors - Rate of failed requests
+# 4. Saturation - How "full" the service is
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slo-recording-rules
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: slo-rules
+    app.kubernetes.io/part-of: observability
+    prometheus: k8s-monitoring
+spec:
+  groups:
+    # =========================================================================
+    # Recording Rules - Pre-computed metrics for dashboards and alerts
+    # =========================================================================
+    - name: slo.recording.requests
+      interval: 30s
+      rules:
+        # Request rate by service (Traffic)
+        - record: service:http_requests:rate5m
+          expr: |
+            sum by (namespace, service) (
+              rate(http_server_request_duration_seconds_count{namespace=~"team-.*"}[5m])
+            )
+
+        # Request rate by service and status code
+        - record: service:http_requests_by_status:rate5m
+          expr: |
+            sum by (namespace, service, http_status_code) (
+              rate(http_server_request_duration_seconds_count{namespace=~"team-.*"}[5m])
+            )
+
+        # Error rate by service (Errors)
+        - record: service:http_errors:rate5m
+          expr: |
+            sum by (namespace, service) (
+              rate(http_server_request_duration_seconds_count{namespace=~"team-.*", http_status_code=~"5.."}[5m])
+            )
+
+        # Error ratio (for SLO calculation)
+        - record: service:http_error_ratio:rate5m
+          expr: |
+            (
+              service:http_errors:rate5m
+              /
+              service:http_requests:rate5m
+            ) or vector(0)
+
+        # Success ratio (availability SLI)
+        - record: service:http_success_ratio:rate5m
+          expr: |
+            1 - service:http_error_ratio:rate5m
+
+    - name: slo.recording.latency
+      interval: 30s
+      rules:
+        # P50 latency by service
+        - record: service:http_latency_p50:5m
+          expr: |
+            histogram_quantile(0.50,
+              sum by (namespace, service, le) (
+                rate(http_server_request_duration_seconds_bucket{namespace=~"team-.*"}[5m])
+              )
+            )
+
+        # P90 latency by service
+        - record: service:http_latency_p90:5m
+          expr: |
+            histogram_quantile(0.90,
+              sum by (namespace, service, le) (
+                rate(http_server_request_duration_seconds_bucket{namespace=~"team-.*"}[5m])
+              )
+            )
+
+        # P99 latency by service (Latency SLI)
+        - record: service:http_latency_p99:5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (namespace, service, le) (
+                rate(http_server_request_duration_seconds_bucket{namespace=~"team-.*"}[5m])
+              )
+            )
+
+        # Requests below latency threshold (for latency SLO)
+        - record: service:http_requests_below_threshold:rate5m
+          expr: |
+            sum by (namespace, service) (
+              rate(http_server_request_duration_seconds_bucket{namespace=~"team-.*", le="0.5"}[5m])
+            )
+
+        # Latency SLI (% of requests < 500ms)
+        - record: service:http_latency_sli:rate5m
+          expr: |
+            (
+              service:http_requests_below_threshold:rate5m
+              /
+              service:http_requests:rate5m
+            ) or vector(0)
+
+    - name: slo.recording.saturation
+      interval: 30s
+      rules:
+        # CPU saturation by namespace
+        - record: namespace:cpu_saturation:ratio
+          expr: |
+            sum by (namespace) (
+              rate(container_cpu_usage_seconds_total{namespace=~"team-.*", container!="", container!="POD"}[5m])
+            )
+            /
+            sum by (namespace) (
+              kube_pod_container_resource_limits{namespace=~"team-.*", resource="cpu", container!=""}
+            )
+
+        # Memory saturation by namespace
+        - record: namespace:memory_saturation:ratio
+          expr: |
+            sum by (namespace) (
+              container_memory_working_set_bytes{namespace=~"team-.*", container!="", container!="POD"}
+            )
+            /
+            sum by (namespace) (
+              kube_pod_container_resource_limits{namespace=~"team-.*", resource="memory", container!=""}
+            )
+
+        # Pod saturation (replicas vs desired)
+        - record: namespace:pod_saturation:ratio
+          expr: |
+            sum by (namespace) (kube_deployment_status_replicas_available{namespace=~"team-.*"})
+            /
+            sum by (namespace) (kube_deployment_spec_replicas{namespace=~"team-.*"})
+
+    - name: slo.recording.error_budget
+      interval: 1m
+      rules:
+        # 30-day error budget remaining (assuming 99.9% SLO)
+        - record: service:error_budget_remaining:ratio
+          expr: |
+            1 - (
+              (1 - avg_over_time(service:http_success_ratio:rate5m[30d]))
+              /
+              (1 - 0.999)
+            )
+
+        # Error budget burn rate (how fast we're consuming budget)
+        - record: service:error_budget_burn_rate:ratio
+          expr: |
+            (
+              1 - service:http_success_ratio:rate5m
+            )
+            /
+            (1 - 0.999)
+
+    # =========================================================================
+    # SLO Alerts - Multi-window, multi-burn-rate alerts
+    # =========================================================================
+    - name: slo.alerts.availability
+      rules:
+        # Fast burn - 2% of 30-day budget in 1 hour (critical)
+        - alert: SLOAvailabilityFastBurn
+          expr: |
+            (
+              service:error_budget_burn_rate:ratio > 14.4
+              and
+              service:http_requests:rate5m > 1
+            )
+          for: 2m
+          labels:
+            severity: critical
+            category: slo
+            signal: errors
+          annotations:
+            summary: "High error rate burning SLO budget fast"
+            description: "Service {{ $labels.service }} in {{ $labels.namespace }} is burning error budget at {{ $value | printf \"%.1f\" }}x the sustainable rate."
+            runbook_url: "https://wiki.internal/runbooks/slo-fast-burn"
+
+        # Slow burn - 5% of 30-day budget in 6 hours (warning)
+        - alert: SLOAvailabilitySlowBurn
+          expr: |
+            (
+              avg_over_time(service:error_budget_burn_rate:ratio[6h]) > 6
+              and
+              service:http_requests:rate5m > 1
+            )
+          for: 30m
+          labels:
+            severity: warning
+            category: slo
+            signal: errors
+          annotations:
+            summary: "Elevated error rate burning SLO budget"
+            description: "Service {{ $labels.service }} in {{ $labels.namespace }} has elevated errors over 6 hours."
+
+        # Error budget exhausted
+        - alert: SLOErrorBudgetExhausted
+          expr: |
+            service:error_budget_remaining:ratio < 0
+          for: 5m
+          labels:
+            severity: critical
+            category: slo
+          annotations:
+            summary: "SLO error budget exhausted"
+            description: "Service {{ $labels.service }} in {{ $labels.namespace }} has exhausted its monthly error budget."
+
+        # Error budget low
+        - alert: SLOErrorBudgetLow
+          expr: |
+            service:error_budget_remaining:ratio < 0.25
+            and
+            service:error_budget_remaining:ratio >= 0
+          for: 1h
+          labels:
+            severity: warning
+            category: slo
+          annotations:
+            summary: "SLO error budget running low ({{ $value | humanizePercentage }} remaining)"
+            description: "Service {{ $labels.service }} has less than 25% of its monthly error budget remaining."
+
+    - name: slo.alerts.latency
+      rules:
+        # P99 latency SLO breach
+        - alert: SLOLatencyP99High
+          expr: |
+            (
+              service:http_latency_p99:5m > 1
+              and
+              service:http_requests:rate5m > 0.5
+            )
+          for: 5m
+          labels:
+            severity: warning
+            category: slo
+            signal: latency
+          annotations:
+            summary: "P99 latency exceeds 1s SLO"
+            description: "Service {{ $labels.service }} P99 latency is {{ $value | printf \"%.2f\" }}s, exceeding the 1s SLO."
+
+        # Latency SLI breach (< 90% of requests under 500ms)
+        - alert: SLOLatencySLIBreach
+          expr: |
+            (
+              service:http_latency_sli:rate5m < 0.9
+              and
+              service:http_requests:rate5m > 0.5
+            )
+          for: 10m
+          labels:
+            severity: warning
+            category: slo
+            signal: latency
+          annotations:
+            summary: "Latency SLI below target"
+            description: "Only {{ $value | humanizePercentage }} of requests to {{ $labels.service }} complete under 500ms (target: 90%)."
+
+    - name: slo.alerts.saturation
+      rules:
+        # High CPU saturation
+        - alert: NamespaceCPUSaturationHigh
+          expr: |
+            namespace:cpu_saturation:ratio > 0.85
+          for: 15m
+          labels:
+            severity: warning
+            category: slo
+            signal: saturation
+          annotations:
+            summary: "High CPU saturation in {{ $labels.namespace }}"
+            description: "Namespace {{ $labels.namespace }} is using {{ $value | humanizePercentage }} of CPU limits."
+
+        # High memory saturation
+        - alert: NamespaceMemorySaturationHigh
+          expr: |
+            namespace:memory_saturation:ratio > 0.85
+          for: 15m
+          labels:
+            severity: warning
+            category: slo
+            signal: saturation
+          annotations:
+            summary: "High memory saturation in {{ $labels.namespace }}"
+            description: "Namespace {{ $labels.namespace }} is using {{ $value | humanizePercentage }} of memory limits."
+
+        # Pod availability low
+        - alert: NamespacePodAvailabilityLow
+          expr: |
+            namespace:pod_saturation:ratio < 0.8
+          for: 5m
+          labels:
+            severity: warning
+            category: slo
+            signal: saturation
+          annotations:
+            summary: "Low pod availability in {{ $labels.namespace }}"
+            description: "Only {{ $value | humanizePercentage }} of desired pods are available in {{ $labels.namespace }}."
+---
+# =============================================================================
+# Apdex Score Recording Rules
+# Application Performance Index for user satisfaction
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: apdex-recording-rules
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: apdex-rules
+    app.kubernetes.io/part-of: observability
+    prometheus: k8s-monitoring
+spec:
+  groups:
+    - name: apdex.recording
+      interval: 30s
+      rules:
+        # Apdex score: (satisfied + tolerating/2) / total
+        # Satisfied: < 500ms, Tolerating: 500ms-2s, Frustrated: > 2s
+        - record: service:apdex_score:5m
+          expr: |
+            (
+              sum by (namespace, service) (
+                rate(http_server_request_duration_seconds_bucket{namespace=~"team-.*", le="0.5"}[5m])
+              )
+              +
+              sum by (namespace, service) (
+                rate(http_server_request_duration_seconds_bucket{namespace=~"team-.*", le="2"}[5m])
+                -
+                rate(http_server_request_duration_seconds_bucket{namespace=~"team-.*", le="0.5"}[5m])
+              ) / 2
+            )
+            /
+            sum by (namespace, service) (
+              rate(http_server_request_duration_seconds_count{namespace=~"team-.*"}[5m])
+            )
+
+    - name: apdex.alerts
+      rules:
+        - alert: ApdexScoreLow
+          expr: |
+            service:apdex_score:5m < 0.7
+            and
+            service:http_requests:rate5m > 0.5
+          for: 10m
+          labels:
+            severity: warning
+            category: user-experience
+          annotations:
+            summary: "Low Apdex score for {{ $labels.service }}"
+            description: "Apdex score is {{ $value | printf \"%.2f\" }} (target: 0.85). Users are experiencing poor performance."

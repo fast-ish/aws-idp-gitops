@@ -1,0 +1,108 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: release-sensor
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: release-sensor
+    app.kubernetes.io/component: sensor
+    app.kubernetes.io/part-of: argo-events
+spec:
+  eventBusName: default
+  template:
+    serviceAccountName: argo-events-sensor
+    container:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+
+  dependencies:
+    - name: github-release
+      eventSourceName: github-webhook
+      eventName: release
+      filters:
+        data:
+          - path: body.action
+            type: string
+            value:
+              - "published"
+
+  triggers:
+    # Trigger production deployment on release
+    - template:
+        name: release-deploy-trigger
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: release-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: ci-cd-pipeline
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: image-name
+                    - name: ecr-registry
+                    - name: argocd-app-name
+                    - name: gitops-path
+                    - name: sign-image
+                      value: "true"
+                    - name: fail-on-vuln
+                      value: "true"
+          parameters:
+            - src:
+                dependencyName: github-release
+                dataKey: body.repository.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-release
+                dataKey: body.release.tag_name
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-release
+                dataTemplate: "{{ .Input.body.repository.name }}"
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-release
+                dataTemplate: "351619759866.dkr.ecr.us-west-2.amazonaws.com"
+              dest: spec.arguments.parameters.3.value
+            - src:
+                dependencyName: github-release
+                dataTemplate: "{{ .Input.body.repository.name }}-prod"
+              dest: spec.arguments.parameters.4.value
+            - src:
+                dependencyName: github-release
+                dataTemplate: "teams/backend/apps/{{ .Input.body.repository.name }}"
+              dest: spec.arguments.parameters.5.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+      conditions: github-release
+
+    # Slack notification on release
+    - template:
+        name: release-notification
+        slack:
+          channel: platform-deployments
+          message: |
+            :rocket: *Release Published*
+            Repository: {{ .Input.body.repository.full_name }}
+            Release: {{ .Input.body.release.tag_name }}
+            Author: {{ .Input.body.release.author.login }}
+            URL: {{ .Input.body.release.html_url }}
+        parameters:
+          - src:
+              dependencyName: github-release
+              dataKey: body
+            dest: Input.body
+      conditions: github-release

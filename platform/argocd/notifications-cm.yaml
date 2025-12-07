@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  # Slack service configuration
+  service.slack: |
+    token: $slack-token
+
+  # Templates
+  template.app-sync-succeeded: |
+    message: |
+      Application {{.app.metadata.name}} has been successfully synced.
+    slack:
+      attachments: |
+        [{
+          "color": "#18be52",
+          "title": "{{.app.metadata.name}} - Sync Succeeded",
+          "title_link": "{{.context.argocdUrl}}/applications/{{.app.metadata.name}}",
+          "fields": [
+            {"title": "Project", "value": "{{.app.spec.project}}", "short": true},
+            {"title": "Revision", "value": "{{.app.status.sync.revision | trunc 7}}", "short": true},
+            {"title": "Namespace", "value": "{{.app.spec.destination.namespace}}", "short": true},
+            {"title": "Health", "value": "{{.app.status.health.status}}", "short": true}
+          ]
+        }]
+
+  template.app-sync-failed: |
+    message: |
+      Application {{.app.metadata.name}} sync failed.
+    slack:
+      attachments: |
+        [{
+          "color": "#E96D76",
+          "title": ":x: {{.app.metadata.name}} - Sync Failed",
+          "title_link": "{{.context.argocdUrl}}/applications/{{.app.metadata.name}}",
+          "fields": [
+            {"title": "Project", "value": "{{.app.spec.project}}", "short": true},
+            {"title": "Namespace", "value": "{{.app.spec.destination.namespace}}", "short": true},
+            {"title": "Error", "value": "{{.app.status.operationState.message | trunc 200}}", "short": false}
+          ]
+        }]
+
+  template.app-health-degraded: |
+    message: |
+      Application {{.app.metadata.name}} health is degraded.
+    slack:
+      attachments: |
+        [{
+          "color": "#f4c030",
+          "title": ":warning: {{.app.metadata.name}} - Health Degraded",
+          "title_link": "{{.context.argocdUrl}}/applications/{{.app.metadata.name}}",
+          "fields": [
+            {"title": "Project", "value": "{{.app.spec.project}}", "short": true},
+            {"title": "Health", "value": "{{.app.status.health.status}}", "short": true},
+            {"title": "Sync Status", "value": "{{.app.status.sync.status}}", "short": true}
+          ]
+        }]
+
+  template.app-deployed: |
+    message: |
+      New version deployed: {{.app.metadata.name}}
+    slack:
+      attachments: |
+        [{
+          "color": "#18be52",
+          "title": ":rocket: {{.app.metadata.name}} - New Deployment",
+          "title_link": "{{.context.argocdUrl}}/applications/{{.app.metadata.name}}",
+          "fields": [
+            {"title": "Revision", "value": "{{.app.status.sync.revision | trunc 7}}", "short": true},
+            {"title": "Namespace", "value": "{{.app.spec.destination.namespace}}", "short": true}
+          ]
+        }]
+
+  # Triggers
+  trigger.on-sync-succeeded: |
+    - description: Application sync succeeded
+      when: app.status.operationState.phase in ['Succeeded'] and app.status.health.status == 'Healthy'
+      send: [app-sync-succeeded]
+
+  trigger.on-sync-failed: |
+    - description: Application sync failed
+      when: app.status.operationState != nil and app.status.operationState.phase in ['Error', 'Failed']
+      send: [app-sync-failed]
+
+  trigger.on-health-degraded: |
+    - description: Application health degraded
+      when: app.status.health.status == 'Degraded'
+      send: [app-health-degraded]
+
+  trigger.on-deployed: |
+    - description: Application deployed
+      when: app.status.operationState != nil and app.status.operationState.phase in ['Succeeded'] and app.status.health.status == 'Healthy' and time.Now().Sub(time.Parse(app.status.operationState.finishedAt)).Minutes() < 2
+      oncePer: app.status.sync.revision
+      send: [app-deployed]
+
+  # Default subscriptions - platform apps get notified
+  subscriptions: |
+    - recipients:
+        - slack:platform-deployments
+      triggers:
+        - on-sync-succeeded
+        - on-sync-failed
+        - on-health-degraded
+
+  # Context for templates
+  context: |
+    argocdUrl: https://argocd.fasti.sh

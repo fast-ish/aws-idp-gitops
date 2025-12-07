@@ -1,0 +1,194 @@
+# =============================================================================
+# ROLLOUT TEMPLATES - Copy these to your team directory and customize
+# =============================================================================
+# These are EXAMPLE templates showing best practices for Argo Rollouts.
+# To use:
+#   1. Copy to teams/<your-team>/apps/<app-name>/rollout.yaml
+#   2. Replace all REPLACE_* placeholders with actual values:
+#      - REPLACE_APP_NAME: Your application name (e.g., "api-gateway")
+#      - REPLACE_IMAGE: Your container image (e.g., "${ECR_REGISTRY}/api-gateway:v1.0.0")
+#      - REPLACE_SERVICE_NAME: Your Kubernetes service name
+#      - REPLACE_INGRESS_NAME: Your ALB Ingress name (canary only)
+#   3. Customize replicas, resources, and rollout strategy as needed
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-rollout-template
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: canary-rollout-template
+    app.kubernetes.io/component: rollout-template
+    app.kubernetes.io/part-of: argo-rollouts
+  annotations:
+    description: |
+      Example canary rollout template. Copy and customize for your service.
+      Features: Gradual traffic shift, automated analysis, auto-rollback.
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: REPLACE_APP_NAME
+  template:
+    metadata:
+      labels:
+        app: REPLACE_APP_NAME
+    spec:
+      containers:
+        - name: app
+          image: REPLACE_IMAGE
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  strategy:
+    canary:
+      # Canary steps - gradual traffic increase
+      steps:
+        - setWeight: 5
+        - pause: {duration: 2m}
+        - setWeight: 10
+        - pause: {duration: 2m}
+        - setWeight: 25
+        - pause: {duration: 5m}
+        - setWeight: 50
+        - pause: {duration: 5m}
+        - setWeight: 75
+        - pause: {duration: 5m}
+        # Final promotion happens automatically after last step
+
+      # Analysis during canary
+      analysis:
+        templates:
+          - templateName: success-rate
+          - templateName: latency-p99
+        startingStep: 2
+        args:
+          - name: service-name
+            value: REPLACE_SERVICE_NAME
+          - name: namespace
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+
+      # Traffic routing via ALB
+      trafficRouting:
+        alb:
+          ingress: REPLACE_INGRESS_NAME
+          servicePort: 80
+          annotationPrefix: alb.ingress.kubernetes.io
+
+      # Anti-affinity for canary pods
+      antiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100
+
+      # Max unavailable during rollout
+      maxUnavailable: 0
+      maxSurge: 1
+
+      # Scale down delay for old version
+      scaleDownDelaySeconds: 30
+
+      # Abort on analysis failure
+      abortScaleDownDelaySeconds: 30
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: bluegreen-rollout-template
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: bluegreen-rollout-template
+    app.kubernetes.io/component: rollout-template
+    app.kubernetes.io/part-of: argo-rollouts
+  annotations:
+    description: |
+      Example blue-green rollout template. Copy and customize for your service.
+      Features: Instant traffic switch, preview service, auto-promotion.
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: REPLACE_APP_NAME
+  template:
+    metadata:
+      labels:
+        app: REPLACE_APP_NAME
+    spec:
+      containers:
+        - name: app
+          image: REPLACE_IMAGE
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  strategy:
+    blueGreen:
+      # Active service (receives production traffic)
+      activeService: REPLACE_SERVICE_NAME
+
+      # Preview service (for testing before promotion)
+      previewService: REPLACE_SERVICE_NAME-preview
+
+      # Auto-promotion after successful analysis
+      autoPromotionEnabled: true
+      autoPromotionSeconds: 300
+
+      # Scale down old version after promotion
+      scaleDownDelaySeconds: 60
+
+      # Analysis before promotion
+      prePromotionAnalysis:
+        templates:
+          - templateName: success-rate
+          - templateName: pod-restarts
+        args:
+          - name: service-name
+            value: REPLACE_SERVICE_NAME-preview
+          - name: namespace
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: pod-hash
+            valueFrom:
+              podTemplateHashValue: Latest
+
+      # Post-promotion verification
+      postPromotionAnalysis:
+        templates:
+          - templateName: success-rate
+        args:
+          - name: service-name
+            value: REPLACE_SERVICE_NAME
+          - name: namespace
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+
+      # Abort if preview doesn't become ready
+      previewReplicaCount: 1

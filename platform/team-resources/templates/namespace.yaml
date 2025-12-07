@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.team.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.team.name }}
+    app.kubernetes.io/component: namespace
+    app.kubernetes.io/part-of: idp
+    app.kubernetes.io/managed-by: argocd
+    team: {{ .Values.team.name }}
+    # Pod Security Standards - enforce restricted
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+  annotations:
+    team.description: {{ .Values.team.description | quote }}
+    team.owner.name: {{ .Values.owner.name | quote }}
+    team.owner.email: {{ .Values.owner.email | quote }}
+    team.owner.slack: {{ .Values.owner.slack | quote }}

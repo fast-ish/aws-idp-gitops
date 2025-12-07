@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scheduled-scaling
+  labels:
+    app.kubernetes.io/name: scheduled-scaling
+    app.kubernetes.io/part-of: platform

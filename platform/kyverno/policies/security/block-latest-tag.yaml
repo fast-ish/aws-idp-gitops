@@ -1,0 +1,47 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: block-latest-tag
+  annotations:
+    policies.kyverno.io/title: Block Latest Image Tag
+    policies.kyverno.io/category: Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Using the :latest tag is dangerous as it can lead to unpredictable deployments.
+      This policy blocks pods that use :latest or no tag at all.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - "team-*"
+      validate:
+        message: "Images must have an explicit tag that is not ':latest'"
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{element.image}}"
+                    operator: Equals
+                    value: "*:latest"
+                  - key: "{{element.image}}"
+                    operator: NotEquals
+                    value: "*:*"
+          - list: "request.object.spec.initContainers || []"
+            deny:
+              conditions:
+                any:
+                  - key: "{{element.image}}"
+                    operator: Equals
+                    value: "*:latest"
+                  - key: "{{element.image}}"
+                    operator: NotEquals
+                    value: "*:*"
