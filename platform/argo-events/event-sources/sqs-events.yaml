@@ -1,0 +1,39 @@
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: sqs-events
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: sqs-events
+    app.kubernetes.io/component: event-source
+    app.kubernetes.io/part-of: argo-events
+spec:
+  eventBusName: default
+  sqs:
+    # ECR image scan completed
+    ecr-scan-completed:
+      region: us-west-2
+      queue: idp-ecr-scan-events
+      waitTimeSeconds: 20
+      jsonBody: true
+      dlq: true
+      accessKey:
+        name: aws-credentials
+        key: access_key
+      secretKey:
+        name: aws-credentials
+        key: secret_key
+
+    # S3 artifact uploaded
+    s3-artifact-uploaded:
+      region: us-west-2
+      queue: idp-s3-events
+      waitTimeSeconds: 20
+      jsonBody: true
+      dlq: true
+      accessKey:
+        name: aws-credentials
+        key: access_key
+      secretKey:
+        name: aws-credentials
+        key: secret_key

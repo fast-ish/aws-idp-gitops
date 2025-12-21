@@ -1,0 +1,97 @@
+# External Secrets Operator Helm Chart Values
+# https://github.com/external-secrets/external-secrets/tree/main/deploy/charts/external-secrets
+
+installCRDs: true
+
+replicaCount: 2
+
+leaderElect: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Webhook configuration
+webhook:
+  replicaCount: 2
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  metrics:
+    service:
+      enabled: true
+
+# Cert controller configuration
+certController:
+  replicaCount: 1
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# Service account for IRSA (AWS IAM Roles for Service Accounts)
+serviceAccount:
+  create: true
+  name: external-secrets
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::${AWS_ACCOUNT_ID}:role/external-secrets-role
+
+# Metrics
+metrics:
+  service:
+    enabled: true
+
+serviceMonitor:
+  enabled: true
+  namespace: observability
+  interval: 30s
+
+# Pod security
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Priority class for critical workloads
+priorityClassName: system-cluster-critical
+
+# Topology spread for HA
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: external-secrets
+
+# Node affinity for control plane nodes
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists

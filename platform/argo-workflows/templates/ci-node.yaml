@@ -1,0 +1,496 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ci-node
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: ci-node
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+    fasti.sh/language: node
+  annotations:
+    description: |
+      CI pipeline for Node.js/React/Next.js applications.
+      Supports npm/pnpm/yarn, Jest/Vitest, and ECR push.
+spec:
+  entrypoint: pipeline
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+  podGC:
+    strategy: OnWorkflowSuccess
+    deleteDelayDuration: 5m
+  onExit: notify
+
+  arguments:
+    parameters:
+      - name: repo-url
+        description: Git repository URL
+      - name: revision
+        default: main
+        description: Git revision (branch, tag, or commit SHA)
+      - name: app-name
+        description: Application name
+      - name: team
+        description: Team name (owner)
+      - name: ecr-registry
+        default: "351619759866.dkr.ecr.us-west-2.amazonaws.com"
+      - name: node-version
+        default: "22"
+      - name: package-manager
+        default: "npm"
+      - name: skip-tests
+        default: "false"
+      - name: deploy-enabled
+        default: "true"
+
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+
+  templates:
+    - name: pipeline
+      dag:
+        tasks:
+          - name: clone
+            template: git-clone
+            arguments:
+              parameters:
+                - name: repo-url
+                  value: "{{workflow.parameters.repo-url}}"
+                - name: revision
+                  value: "{{workflow.parameters.revision}}"
+
+          - name: install
+            template: node-install
+            dependencies: [clone]
+            arguments:
+              parameters:
+                - name: node-version
+                  value: "{{workflow.parameters.node-version}}"
+                - name: package-manager
+                  value: "{{workflow.parameters.package-manager}}"
+
+          - name: lint
+            template: node-lint
+            dependencies: [install]
+            arguments:
+              parameters:
+                - name: node-version
+                  value: "{{workflow.parameters.node-version}}"
+                - name: package-manager
+                  value: "{{workflow.parameters.package-manager}}"
+
+          - name: typecheck
+            template: node-typecheck
+            dependencies: [install]
+            arguments:
+              parameters:
+                - name: node-version
+                  value: "{{workflow.parameters.node-version}}"
+                - name: package-manager
+                  value: "{{workflow.parameters.package-manager}}"
+
+          - name: test
+            template: node-test
+            when: "{{workflow.parameters.skip-tests}} != true"
+            dependencies: [install]
+            arguments:
+              parameters:
+                - name: node-version
+                  value: "{{workflow.parameters.node-version}}"
+                - name: package-manager
+                  value: "{{workflow.parameters.package-manager}}"
+
+          - name: build
+            template: node-build
+            dependencies: [lint, typecheck, test]
+            arguments:
+              parameters:
+                - name: node-version
+                  value: "{{workflow.parameters.node-version}}"
+                - name: package-manager
+                  value: "{{workflow.parameters.package-manager}}"
+
+          - name: build-image
+            template: kaniko-build
+            dependencies: [build]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.ecr-registry}}/{{workflow.parameters.team}}/{{workflow.parameters.app-name}}"
+                - name: tag
+                  value: "{{workflow.parameters.revision}}"
+
+          - name: scan-image
+            template: trivy-scan
+            dependencies: [build-image]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.ecr-registry}}/{{workflow.parameters.team}}/{{workflow.parameters.app-name}}:{{workflow.parameters.revision}}"
+
+          - name: update-gitops
+            template: update-gitops-repo
+            when: "{{workflow.parameters.deploy-enabled}} == true"
+            dependencies: [scan-image]
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+                - name: team
+                  value: "{{workflow.parameters.team}}"
+                - name: image-tag
+                  value: "{{workflow.parameters.revision}}"
+
+    - name: git-clone
+      inputs:
+        parameters:
+          - name: repo-url
+          - name: revision
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Cloning {{inputs.parameters.repo-url}} at {{inputs.parameters.revision}}"
+            git clone --depth 1 --branch {{inputs.parameters.revision}} \
+              {{inputs.parameters.repo-url}} /work/src || \
+            git clone {{inputs.parameters.repo-url}} /work/src && \
+              cd /work/src && git checkout {{inputs.parameters.revision}}
+            cd /work/src
+            echo "COMMIT_SHA=$(git rev-parse HEAD)" > /work/build-info
+            cat /work/build-info
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: node-install
+      inputs:
+        parameters:
+          - name: node-version
+          - name: package-manager
+      container:
+        image: node:{{inputs.parameters.node-version}}-alpine
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            cd /work/src
+
+            if [ "{{inputs.parameters.package-manager}}" = "pnpm" ]; then
+              npm install -g pnpm
+              pnpm install --frozen-lockfile
+            elif [ "{{inputs.parameters.package-manager}}" = "yarn" ]; then
+              yarn install --frozen-lockfile
+            else
+              npm ci
+            fi
+
+            echo "Dependencies installed"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+    - name: node-lint
+      inputs:
+        parameters:
+          - name: node-version
+          - name: package-manager
+      container:
+        image: node:{{inputs.parameters.node-version}}-alpine
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            cd /work/src
+
+            RUN_CMD="npm run"
+            if [ "{{inputs.parameters.package-manager}}" = "pnpm" ]; then
+              npm install -g pnpm
+              RUN_CMD="pnpm"
+            elif [ "{{inputs.parameters.package-manager}}" = "yarn" ]; then
+              RUN_CMD="yarn"
+            fi
+
+            $RUN_CMD lint || true
+            echo "Lint completed"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+
+    - name: node-typecheck
+      inputs:
+        parameters:
+          - name: node-version
+          - name: package-manager
+      container:
+        image: node:{{inputs.parameters.node-version}}-alpine
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            cd /work/src
+
+            RUN_CMD="npm run"
+            if [ "{{inputs.parameters.package-manager}}" = "pnpm" ]; then
+              npm install -g pnpm
+              RUN_CMD="pnpm"
+            elif [ "{{inputs.parameters.package-manager}}" = "yarn" ]; then
+              RUN_CMD="yarn"
+            fi
+
+            if grep -q '"typecheck"' package.json 2>/dev/null; then
+              $RUN_CMD typecheck
+            elif grep -q '"type-check"' package.json 2>/dev/null; then
+              $RUN_CMD type-check
+            else
+              echo "No typecheck script found, skipping"
+            fi
+            echo "Typecheck completed"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+
+    - name: node-test
+      inputs:
+        parameters:
+          - name: node-version
+          - name: package-manager
+      container:
+        image: node:{{inputs.parameters.node-version}}-alpine
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            cd /work/src
+
+            RUN_CMD="npm run"
+            if [ "{{inputs.parameters.package-manager}}" = "pnpm" ]; then
+              npm install -g pnpm
+              RUN_CMD="pnpm"
+            elif [ "{{inputs.parameters.package-manager}}" = "yarn" ]; then
+              RUN_CMD="yarn"
+            fi
+
+            $RUN_CMD test
+            echo "Tests completed"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+          limits:
+            cpu: 4000m
+            memory: 4Gi
+
+    - name: node-build
+      inputs:
+        parameters:
+          - name: node-version
+          - name: package-manager
+      container:
+        image: node:{{inputs.parameters.node-version}}-alpine
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            cd /work/src
+
+            RUN_CMD="npm run"
+            if [ "{{inputs.parameters.package-manager}}" = "pnpm" ]; then
+              npm install -g pnpm
+              RUN_CMD="pnpm"
+            elif [ "{{inputs.parameters.package-manager}}" = "yarn" ]; then
+              RUN_CMD="yarn"
+            fi
+
+            $RUN_CMD build
+            echo "Build completed"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+          limits:
+            cpu: 4000m
+            memory: 4Gi
+
+    - name: kaniko-build
+      inputs:
+        parameters:
+          - name: image
+          - name: tag
+      container:
+        image: gcr.io/kaniko-project/executor:v1.23.2
+        args:
+          - --dockerfile=/work/src/Dockerfile
+          - --context=/work/src
+          - --destination={{inputs.parameters.image}}:{{inputs.parameters.tag}}
+          - --destination={{inputs.parameters.image}}:latest
+          - --cache=true
+          - --cache-repo={{inputs.parameters.image}}-cache
+          - --snapshot-mode=redo
+          - --use-new-run
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+    - name: trivy-scan
+      inputs:
+        parameters:
+          - name: image
+      container:
+        image: aquasec/trivy:0.48.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Scanning image: {{inputs.parameters.image}}"
+            trivy image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 0 \
+              {{inputs.parameters.image}}
+            echo "Scan completed"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+
+    - name: update-gitops-repo
+      inputs:
+        parameters:
+          - name: app-name
+          - name: team
+          - name: image-tag
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            apk add --no-cache yq
+
+            cd /tmp
+            git clone https://github.com/fast-ish/aws-idp-gitops.git gitops
+            cd gitops
+
+            APP_FILE="teams/{{inputs.parameters.team}}/apps/{{inputs.parameters.app-name}}/kustomization.yaml"
+
+            if [ -f "$APP_FILE" ]; then
+              echo "Updating image tag to {{inputs.parameters.image-tag}}"
+              yq -i '.images[0].newTag = "{{inputs.parameters.image-tag}}"' "$APP_FILE"
+
+              git config user.email "argoworkflows@fasti.sh"
+              git config user.name "Argo Workflows"
+              git add .
+              git commit -m "chore({{inputs.parameters.app-name}}): update image to {{inputs.parameters.image-tag}}" || echo "No changes"
+              git push origin main
+            else
+              echo "App file not found: $APP_FILE - skipping gitops update"
+            fi
+        env:
+          - name: GIT_CREDENTIALS
+            valueFrom:
+              secretKeyRef:
+                name: github-credentials
+                key: token
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: notify
+      container:
+        image: curlimages/curl:8.5.0
+        command: [sh, -c]
+        args:
+          - |
+            STATUS="success"
+            COLOR="#36a64f"
+            if [ "{{workflow.status}}" != "Succeeded" ]; then
+              STATUS="failed"
+              COLOR="#dc3545"
+            fi
+
+            curl -X POST $SLACK_WEBHOOK_URL \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"attachments\": [{
+                  \"color\": \"$COLOR\",
+                  \"title\": \"Node.js CI Pipeline $STATUS\",
+                  \"text\": \"{{workflow.parameters.app-name}} - {{workflow.parameters.revision}}\",
+                  \"fields\": [
+                    {\"title\": \"Team\", \"value\": \"{{workflow.parameters.team}}\", \"short\": true},
+                    {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true}
+                  ]
+                }]
+              }" 2>/dev/null || true
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook
+                key: url
+                optional: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi

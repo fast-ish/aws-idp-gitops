@@ -1,0 +1,436 @@
+# =============================================================================
+# VELERO RESTORE WORKFLOW
+# =============================================================================
+# Argo Workflow for orchestrating Velero restores with validation.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: velero-restore
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: velero-restore
+    app.kubernetes.io/component: workflow-template
+spec:
+  entrypoint: restore
+  serviceAccountName: argo-workflow
+  arguments:
+    parameters:
+      - name: backup-name
+        description: "Name of the Velero backup to restore"
+      - name: target-namespace
+        description: "Target namespace (empty = original namespace)"
+        default: ""
+      - name: include-resources
+        description: "Comma-separated list of resources to include (empty = all)"
+        default: ""
+      - name: exclude-resources
+        description: "Comma-separated list of resources to exclude"
+        default: "events,events.events.k8s.io"
+      - name: dry-run
+        description: "Dry run mode (validate only)"
+        default: "false"
+
+  templates:
+    # =========================================================================
+    # MAIN RESTORE WORKFLOW
+    # =========================================================================
+    - name: restore
+      dag:
+        tasks:
+          # Validate backup exists
+          - name: validate-backup
+            template: validate-backup
+            arguments:
+              parameters:
+                - name: backup-name
+                  value: "{{workflow.parameters.backup-name}}"
+
+          # Get backup details
+          - name: get-backup-info
+            template: get-backup-info
+            dependencies: [validate-backup]
+            arguments:
+              parameters:
+                - name: backup-name
+                  value: "{{workflow.parameters.backup-name}}"
+
+          # Notify start
+          - name: notify-start
+            template: send-notification
+            dependencies: [get-backup-info]
+            arguments:
+              parameters:
+                - name: message
+                  value: "Starting restore from backup: {{workflow.parameters.backup-name}}"
+                - name: status
+                  value: "in_progress"
+
+          # Create restore
+          - name: create-restore
+            template: create-restore
+            dependencies: [notify-start]
+            when: "{{workflow.parameters.dry-run}} != true"
+            arguments:
+              parameters:
+                - name: backup-name
+                  value: "{{workflow.parameters.backup-name}}"
+                - name: target-namespace
+                  value: "{{workflow.parameters.target-namespace}}"
+                - name: include-resources
+                  value: "{{workflow.parameters.include-resources}}"
+                - name: exclude-resources
+                  value: "{{workflow.parameters.exclude-resources}}"
+
+          # Wait for restore
+          - name: wait-for-restore
+            template: wait-for-restore
+            dependencies: [create-restore]
+            when: "{{workflow.parameters.dry-run}} != true"
+            arguments:
+              parameters:
+                - name: restore-name
+                  value: "{{tasks.create-restore.outputs.parameters.restore-name}}"
+
+          # Validate restore
+          - name: validate-restore
+            template: validate-restore
+            dependencies: [wait-for-restore]
+            when: "{{workflow.parameters.dry-run}} != true"
+            arguments:
+              parameters:
+                - name: restore-name
+                  value: "{{tasks.create-restore.outputs.parameters.restore-name}}"
+
+          # Notify completion
+          - name: notify-complete
+            template: send-notification
+            dependencies: [validate-restore]
+            arguments:
+              parameters:
+                - name: message
+                  value: "Restore completed: {{workflow.parameters.backup-name}}"
+                - name: status
+                  value: "{{tasks.validate-restore.outputs.parameters.status}}"
+
+    # =========================================================================
+    # VALIDATE BACKUP EXISTS
+    # =========================================================================
+    - name: validate-backup
+      inputs:
+        parameters:
+          - name: backup-name
+      script:
+        image: velero/velero:v1.13.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          BACKUP_NAME="{{inputs.parameters.backup-name}}"
+
+          echo "Validating backup: $BACKUP_NAME"
+
+          # Check backup exists
+          velero backup get "$BACKUP_NAME" -o json > /tmp/backup.json
+
+          STATUS=$(jq -r '.status.phase' /tmp/backup.json)
+
+          if [ "$STATUS" != "Completed" ]; then
+            echo "Error: Backup status is $STATUS, expected Completed"
+            exit 1
+          fi
+
+          echo "Backup validated successfully"
+          echo "Status: $STATUS"
+
+    # =========================================================================
+    # GET BACKUP INFO
+    # =========================================================================
+    - name: get-backup-info
+      inputs:
+        parameters:
+          - name: backup-name
+      outputs:
+        parameters:
+          - name: backup-info
+            valueFrom:
+              path: /tmp/backup-info.json
+      script:
+        image: velero/velero:v1.13.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          BACKUP_NAME="{{inputs.parameters.backup-name}}"
+
+          velero backup describe "$BACKUP_NAME" --details -o json > /tmp/backup-info.json
+
+          echo "Backup Details:"
+          jq '.' /tmp/backup-info.json
+
+    # =========================================================================
+    # CREATE RESTORE
+    # =========================================================================
+    - name: create-restore
+      inputs:
+        parameters:
+          - name: backup-name
+          - name: target-namespace
+          - name: include-resources
+          - name: exclude-resources
+      outputs:
+        parameters:
+          - name: restore-name
+            valueFrom:
+              path: /tmp/restore-name
+      script:
+        image: velero/velero:v1.13.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          BACKUP_NAME="{{inputs.parameters.backup-name}}"
+          TARGET_NS="{{inputs.parameters.target-namespace}}"
+          INCLUDE_RESOURCES="{{inputs.parameters.include-resources}}"
+          EXCLUDE_RESOURCES="{{inputs.parameters.exclude-resources}}"
+
+          RESTORE_NAME="restore-${BACKUP_NAME}-$(date +%Y%m%d%H%M%S)"
+          echo "$RESTORE_NAME" > /tmp/restore-name
+
+          echo "Creating restore: $RESTORE_NAME"
+
+          CMD="velero restore create $RESTORE_NAME --from-backup $BACKUP_NAME"
+
+          if [ -n "$TARGET_NS" ]; then
+            CMD="$CMD --namespace-mappings '*:$TARGET_NS'"
+          fi
+
+          if [ -n "$INCLUDE_RESOURCES" ]; then
+            CMD="$CMD --include-resources $INCLUDE_RESOURCES"
+          fi
+
+          if [ -n "$EXCLUDE_RESOURCES" ]; then
+            CMD="$CMD --exclude-resources $EXCLUDE_RESOURCES"
+          fi
+
+          echo "Running: $CMD"
+          eval $CMD
+
+          echo "Restore created: $RESTORE_NAME"
+
+    # =========================================================================
+    # WAIT FOR RESTORE
+    # =========================================================================
+    - name: wait-for-restore
+      inputs:
+        parameters:
+          - name: restore-name
+      script:
+        image: velero/velero:v1.13.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          RESTORE_NAME="{{inputs.parameters.restore-name}}"
+          MAX_WAIT=1800  # 30 minutes
+          INTERVAL=10
+
+          echo "Waiting for restore: $RESTORE_NAME"
+
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(velero restore get "$RESTORE_NAME" -o json | jq -r '.status.phase')
+
+            echo "Status: $STATUS (${ELAPSED}s elapsed)"
+
+            case "$STATUS" in
+              Completed)
+                echo "Restore completed successfully"
+                exit 0
+                ;;
+              Failed|PartiallyFailed)
+                echo "Restore failed with status: $STATUS"
+                velero restore describe "$RESTORE_NAME" --details
+                exit 1
+                ;;
+              InProgress|New)
+                sleep $INTERVAL
+                ELAPSED=$((ELAPSED + INTERVAL))
+                ;;
+              *)
+                echo "Unknown status: $STATUS"
+                sleep $INTERVAL
+                ELAPSED=$((ELAPSED + INTERVAL))
+                ;;
+            esac
+          done
+
+          echo "Timeout waiting for restore"
+          exit 1
+
+    # =========================================================================
+    # VALIDATE RESTORE
+    # =========================================================================
+    - name: validate-restore
+      inputs:
+        parameters:
+          - name: restore-name
+      outputs:
+        parameters:
+          - name: status
+            valueFrom:
+              path: /tmp/status
+      script:
+        image: velero/velero:v1.13.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          RESTORE_NAME="{{inputs.parameters.restore-name}}"
+
+          echo "Validating restore: $RESTORE_NAME"
+
+          # Get restore details
+          velero restore describe "$RESTORE_NAME" --details > /tmp/restore-details.txt
+
+          # Check for warnings
+          WARNINGS=$(velero restore get "$RESTORE_NAME" -o json | jq -r '.status.warnings // 0')
+          ERRORS=$(velero restore get "$RESTORE_NAME" -o json | jq -r '.status.errors // 0')
+
+          echo "Warnings: $WARNINGS"
+          echo "Errors: $ERRORS"
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "failed" > /tmp/status
+            echo "Restore completed with errors"
+            cat /tmp/restore-details.txt
+            exit 1
+          elif [ "$WARNINGS" -gt 0 ]; then
+            echo "warning" > /tmp/status
+            echo "Restore completed with warnings"
+          else
+            echo "success" > /tmp/status
+            echo "Restore completed successfully"
+          fi
+
+    # =========================================================================
+    # SEND NOTIFICATION
+    # =========================================================================
+    - name: send-notification
+      inputs:
+        parameters:
+          - name: message
+          - name: status
+      script:
+        image: curlimages/curl:8.5.0
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook
+                key: url
+                optional: true
+        command: [sh]
+        source: |
+          #!/bin/sh
+
+          MESSAGE="{{inputs.parameters.message}}"
+          STATUS="{{inputs.parameters.status}}"
+
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "Slack not configured"
+            echo "Message: $MESSAGE"
+            echo "Status: $STATUS"
+            exit 0
+          fi
+
+          case "$STATUS" in
+            success)
+              EMOJI="✅"
+              COLOR="good"
+              ;;
+            warning)
+              EMOJI="⚠️"
+              COLOR="warning"
+              ;;
+            in_progress)
+              EMOJI="🔄"
+              COLOR="#439FE0"
+              ;;
+            *)
+              EMOJI="❌"
+              COLOR="danger"
+              ;;
+          esac
+
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"${COLOR}\",
+                \"blocks\": [
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"${EMOJI} *Velero Restore*\\n${MESSAGE}\\n*Status:* ${STATUS}\"
+                    }
+                  }
+                ]
+              }]
+            }"
+---
+# =============================================================================
+# LIST BACKUPS WORKFLOW
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: velero-list-backups
+  namespace: argo
+spec:
+  entrypoint: list-backups
+  serviceAccountName: argo-workflow
+  arguments:
+    parameters:
+      - name: namespace
+        description: "Filter by namespace (optional)"
+        default: ""
+      - name: label-selector
+        description: "Filter by labels (optional)"
+        default: ""
+  templates:
+    - name: list-backups
+      script:
+        image: velero/velero:v1.13.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+
+          NAMESPACE="{{workflow.parameters.namespace}}"
+          SELECTOR="{{workflow.parameters.label-selector}}"
+
+          echo "=== Available Velero Backups ==="
+          echo ""
+
+          CMD="velero backup get"
+
+          if [ -n "$SELECTOR" ]; then
+            CMD="$CMD -l $SELECTOR"
+          fi
+
+          eval $CMD
+
+          echo ""
+          echo "=== Backup Details ==="
+
+          for backup in $(velero backup get -o json | jq -r '.items[].metadata.name'); do
+            echo ""
+            echo "--- $backup ---"
+            velero backup describe "$backup" | head -20
+          done

@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Post-deployment resources that require all CDK stacks to be deployed first.
+# These cannot be deployed during CDK because they reference deployed resources.
+#
+# The following are deployed during CDK via Helm charts:
+# - Backstage HPA/PDB: via backstage helm chart
+# - Team namespaces: can be added to core-addons
+# - Argo Workflows DB secret: can be added to argo-workflows helm
+
+resources:
+  - backstage-production-config.yaml

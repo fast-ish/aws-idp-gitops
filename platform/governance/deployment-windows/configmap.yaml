@@ -1,0 +1,81 @@
+# =============================================================================
+# DEPLOYMENT WINDOWS CONFIGURATION
+# =============================================================================
+# Controls when deployments are allowed.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: governance
+  labels:
+    app.kubernetes.io/name: governance
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deployment-windows
+  namespace: governance
+  labels:
+    app.kubernetes.io/name: deployment-windows
+    app.kubernetes.io/component: configuration
+    app.kubernetes.io/part-of: governance
+data:
+  # Current freeze status: "open" or "frozen"
+  status: "open"
+
+  # Reason for freeze (if frozen)
+  freeze_reason: ""
+
+  # Freeze window timestamps (ISO 8601)
+  freeze_start: ""
+  freeze_end: ""
+
+  # Teams that can deploy during freeze (comma-separated)
+  allowed_teams: "platform"
+
+  # Environments that are always frozen during off-hours
+  auto_freeze_environments: "prod"
+
+  # Business hours configuration (24-hour format, UTC)
+  business_hours_start: "14:00"  # 6 AM Pacific
+  business_hours_end: "04:00"    # 8 PM Pacific
+
+  # Working days (0=Sunday, 6=Saturday)
+  working_days: "1,2,3,4,5"
+
+  # Holiday freeze dates (YYYY-MM-DD, comma-separated)
+  holiday_freeze_dates: ""
+---
+# =============================================================================
+# RBAC FOR DEPLOYMENT WINDOW MANAGEMENT
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deployment-freeze-sa
+  namespace: governance
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-freeze-manager
+  namespace: governance
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["deployment-windows"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployment-freeze-manager
+  namespace: governance
+subjects:
+  - kind: ServiceAccount
+    name: deployment-freeze-sa
+    namespace: governance
+roleRef:
+  kind: Role
+  name: deployment-freeze-manager
+  apiGroup: rbac.authorization.k8s.io

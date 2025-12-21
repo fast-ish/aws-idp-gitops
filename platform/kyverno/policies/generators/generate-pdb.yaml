@@ -1,0 +1,106 @@
+# =============================================================================
+# AUTO-GENERATE POD DISRUPTION BUDGETS
+# =============================================================================
+# Creates PDBs for deployments with multiple replicas to ensure availability
+# during node drains (spot interruptions, upgrades, etc.)
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-pdb-for-deployments
+  annotations:
+    policies.kyverno.io/title: Generate PDB for Deployments
+    policies.kyverno.io/category: Availability
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Deployment, PodDisruptionBudget
+    policies.kyverno.io/description: >-
+      Automatically creates PodDisruptionBudgets for deployments with 2 or
+      more replicas in team namespaces. Ensures at least 1 pod is always
+      available during voluntary disruptions.
+spec:
+  rules:
+    - name: create-pdb-for-deployment
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+              namespaces:
+                - "team-*"
+                - "prod-*"
+      preconditions:
+        all:
+          # Only create PDB if replicas > 1
+          - key: "{{ request.object.spec.replicas || `1` }}"
+            operator: GreaterThan
+            value: 1
+          # Skip if PDB already exists annotation
+          - key: "{{ request.object.metadata.annotations.\"fasti.sh/pdb-managed\" || 'false' }}"
+            operator: NotEquals
+            value: "true"
+      generate:
+        synchronize: true
+        apiVersion: policy/v1
+        kind: PodDisruptionBudget
+        name: "{{ request.object.metadata.name }}-pdb"
+        namespace: "{{ request.namespace }}"
+        data:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "{{ request.object.metadata.name }}"
+              app.kubernetes.io/managed-by: kyverno
+              fasti.sh/generated: "true"
+            ownerReferences:
+              - apiVersion: apps/v1
+                kind: Deployment
+                name: "{{ request.object.metadata.name }}"
+                uid: "{{ request.object.metadata.uid }}"
+          spec:
+            minAvailable: 1
+            selector:
+              matchLabels:
+                "{{ request.object.spec.selector.matchLabels | to_entries | [0].key }}": "{{ request.object.spec.selector.matchLabels | to_entries | [0].value }}"
+---
+# =============================================================================
+# AUTO-GENERATE PDB FOR ARGO ROLLOUTS
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-pdb-for-rollouts
+  annotations:
+    policies.kyverno.io/title: Generate PDB for Rollouts
+    policies.kyverno.io/category: Availability
+    policies.kyverno.io/subject: Rollout, PodDisruptionBudget
+spec:
+  rules:
+    - name: create-pdb-for-rollout
+      match:
+        any:
+          - resources:
+              kinds:
+                - Rollout
+              namespaces:
+                - "team-*"
+                - "prod-*"
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.replicas || `1` }}"
+            operator: GreaterThan
+            value: 1
+      generate:
+        synchronize: true
+        apiVersion: policy/v1
+        kind: PodDisruptionBudget
+        name: "{{ request.object.metadata.name }}-pdb"
+        namespace: "{{ request.namespace }}"
+        data:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "{{ request.object.metadata.name }}"
+              app.kubernetes.io/managed-by: kyverno
+          spec:
+            minAvailable: 1
+            selector:
+              matchLabels:
+                "{{ request.object.spec.selector.matchLabels | to_entries | [0].key }}": "{{ request.object.spec.selector.matchLabels | to_entries | [0].value }}"

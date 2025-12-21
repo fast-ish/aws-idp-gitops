@@ -1,0 +1,127 @@
+# =============================================================================
+# VELERO BACKUP ALERTS
+# =============================================================================
+# Monitors Velero backup health and alerts on failures.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: velero-alerts
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: velero-alerts
+    app.kubernetes.io/component: alerting
+    prometheus: main
+spec:
+  groups:
+    - name: velero.backup
+      interval: 1m
+      rules:
+        # Backup failed
+        - alert: VeleroBackupFailed
+          expr: |
+            increase(velero_backup_failure_total[1h]) > 0
+          for: 5m
+          labels:
+            severity: critical
+            category: backup
+            team: platform
+          annotations:
+            summary: "Velero backup failed"
+            description: "A Velero backup has failed in the last hour. Check velero logs for details."
+            runbook_url: "https://wiki.internal/runbooks/velero-backup-failed"
+            dashboard_url: "https://grafana.internal/d/velero/velero-overview"
+
+        # No successful backup in 24 hours
+        - alert: VeleroBackupMissing
+          expr: |
+            time() - velero_backup_last_successful_timestamp{schedule!=""} > 86400
+          for: 1h
+          labels:
+            severity: warning
+            category: backup
+            team: platform
+          annotations:
+            summary: "No successful Velero backup in 24 hours"
+            description: "Schedule {{ $labels.schedule }} has not completed a successful backup in over 24 hours."
+            runbook_url: "https://wiki.internal/runbooks/velero-backup-missing"
+
+        # No backup in 48 hours (critical)
+        - alert: VeleroBackupMissingCritical
+          expr: |
+            time() - velero_backup_last_successful_timestamp{schedule!=""} > 172800
+          for: 30m
+          labels:
+            severity: critical
+            category: backup
+            team: platform
+          annotations:
+            summary: "No successful Velero backup in 48 hours"
+            description: "Schedule {{ $labels.schedule }} has not completed a successful backup in over 48 hours. Immediate attention required."
+
+        # Backup partially failed
+        - alert: VeleroBackupPartialFailure
+          expr: |
+            increase(velero_backup_partial_failure_total[1h]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            category: backup
+            team: platform
+          annotations:
+            summary: "Velero backup partially failed"
+            description: "A Velero backup completed with partial failures. Some resources may not be backed up."
+
+        # Restore failed
+        - alert: VeleroRestoreFailed
+          expr: |
+            increase(velero_restore_failure_total[1h]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            category: backup
+            team: platform
+          annotations:
+            summary: "Velero restore failed"
+            description: "A Velero restore operation has failed. Check velero logs immediately."
+            runbook_url: "https://wiki.internal/runbooks/velero-restore-failed"
+
+        # Backup storage location unavailable
+        - alert: VeleroBackupStorageLocationUnavailable
+          expr: |
+            velero_backup_storage_location_available == 0
+          for: 5m
+          labels:
+            severity: critical
+            category: backup
+            team: platform
+          annotations:
+            summary: "Velero backup storage location unavailable"
+            description: "Backup storage location {{ $labels.name }} is not available. Backups cannot be created or restored."
+
+        # Backup taking too long
+        - alert: VeleroBackupDurationHigh
+          expr: |
+            velero_backup_duration_seconds{phase="Completed"} > 3600
+          for: 0m
+          labels:
+            severity: warning
+            category: backup
+            team: platform
+          annotations:
+            summary: "Velero backup duration is high"
+            description: "Backup {{ $labels.backup }} took {{ $value | humanizeDuration }} to complete. Consider optimizing backup scope."
+
+    - name: velero.recording
+      interval: 1m
+      rules:
+        # Recording rule for backup success rate
+        - record: velero:backup:success_rate
+          expr: |
+            sum(velero_backup_success_total) /
+            (sum(velero_backup_success_total) + sum(velero_backup_failure_total))
+
+        # Recording rule for total backup size
+        - record: velero:backup:total_size_bytes
+          expr: |
+            sum(velero_backup_items_total) by (schedule)

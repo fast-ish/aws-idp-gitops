@@ -1,0 +1,122 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ci-build-push
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: ci-build-push
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+spec:
+  entrypoint: build-and-push
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+  podGC:
+    strategy: OnWorkflowSuccess
+    deleteDelayDuration: 5m
+
+  arguments:
+    parameters:
+      - name: repo-url
+        description: Git repository URL
+      - name: revision
+        description: Git revision (branch, tag, or commit SHA)
+        default: main
+      - name: image-name
+        description: Name for the Docker image
+      - name: dockerfile
+        description: Path to Dockerfile
+        default: Dockerfile
+      - name: context
+        description: Docker build context path
+        default: "."
+
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+
+  templates:
+    - name: build-and-push
+      dag:
+        tasks:
+          - name: clone
+            template: git-clone
+            arguments:
+              parameters:
+                - name: repo-url
+                  value: "{{workflow.parameters.repo-url}}"
+                - name: revision
+                  value: "{{workflow.parameters.revision}}"
+
+          - name: build
+            template: kaniko-build
+            dependencies: [clone]
+            arguments:
+              parameters:
+                - name: image-name
+                  value: "{{workflow.parameters.image-name}}"
+                - name: dockerfile
+                  value: "{{workflow.parameters.dockerfile}}"
+                - name: context
+                  value: "{{workflow.parameters.context}}"
+
+    - name: git-clone
+      inputs:
+        parameters:
+          - name: repo-url
+          - name: revision
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            git clone --depth 1 --branch {{inputs.parameters.revision}} \
+              {{inputs.parameters.repo-url}} /work/src
+            cd /work/src
+            echo "Cloned revision: $(git rev-parse HEAD)"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: kaniko-build
+      inputs:
+        parameters:
+          - name: image-name
+          - name: dockerfile
+          - name: context
+      container:
+        image: gcr.io/kaniko-project/executor:v1.23.2
+        args:
+          - --dockerfile=/work/src/{{inputs.parameters.context}}/{{inputs.parameters.dockerfile}}
+          - --context=/work/src/{{inputs.parameters.context}}
+          - --destination={{inputs.parameters.image-name}}:{{workflow.parameters.revision}}
+          - --destination={{inputs.parameters.image-name}}:latest
+          - --cache=true
+          - --cache-repo={{inputs.parameters.image-name}}-cache
+          - --snapshot-mode=redo
+          - --use-new-run
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi

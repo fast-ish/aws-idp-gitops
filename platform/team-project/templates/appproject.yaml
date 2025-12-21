@@ -1,0 +1,110 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-{{ .Values.team.name }}
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: {{ .Values.team.name }}
+    app.kubernetes.io/component: appproject
+    app.kubernetes.io/part-of: idp
+    team: {{ .Values.team.name }}
+  annotations:
+    team.description: {{ .Values.team.description | quote }}
+    team.owner: {{ .Values.owner.email | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "ArgoCD project for {{ .Values.team.name }} team"
+  
+  # Source repositories this project can use
+  sourceRepos:
+    - "https://github.com/fast-ish/*"
+    - "https://github.com/{{ .Values.team.name }}/*"
+  
+  # Destination clusters and namespaces
+  destinations:
+    - namespace: {{ .Values.team.namespace }}
+      server: https://kubernetes.default.svc
+  
+  # Cluster resources the project can manage (deny all by default)
+  clusterResourceWhitelist: []
+  
+  # Namespace-scoped resources the project can manage
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: ""
+      kind: PersistentVolumeClaim
+    - group: ""
+      kind: Pod
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: StatefulSet
+    - group: apps
+      kind: DaemonSet
+    - group: apps
+      kind: ReplicaSet
+    - group: batch
+      kind: Job
+    - group: batch
+      kind: CronJob
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: policy
+      kind: PodDisruptionBudget
+    # Argo Rollouts resources for progressive delivery
+    - group: argoproj.io
+      kind: Rollout
+    - group: argoproj.io
+      kind: AnalysisTemplate
+    - group: argoproj.io
+      kind: AnalysisRun
+    - group: argoproj.io
+      kind: Experiment
+  
+  # Deny these resources even if in whitelist
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+  
+  # Roles for this project
+  roles:
+    - name: developer
+      description: "Developer access - can sync and view applications"
+      policies:
+        - p, proj:team-{{ .Values.team.name }}:developer, applications, get, team-{{ .Values.team.name }}/*, allow
+        - p, proj:team-{{ .Values.team.name }}:developer, applications, sync, team-{{ .Values.team.name }}/*, allow
+        - p, proj:team-{{ .Values.team.name }}:developer, applications, action/*, team-{{ .Values.team.name }}/*, allow
+        - p, proj:team-{{ .Values.team.name }}:developer, logs, get, team-{{ .Values.team.name }}/*, allow
+        - p, proj:team-{{ .Values.team.name }}:developer, exec, create, team-{{ .Values.team.name }}/*, allow
+    - name: viewer
+      description: "Viewer access - read-only"
+      policies:
+        - p, proj:team-{{ .Values.team.name }}:viewer, applications, get, team-{{ .Values.team.name }}/*, allow
+        - p, proj:team-{{ .Values.team.name }}:viewer, logs, get, team-{{ .Values.team.name }}/*, allow
+  
+  # Sync windows (optional - uncomment to restrict sync times)
+  # syncWindows:
+  #   - kind: allow
+  #     schedule: "0 6-22 * * 1-5"  # Mon-Fri 6am-10pm
+  #     duration: 16h
+  #     applications:
+  #       - "*"
+  #   - kind: deny
+  #     schedule: "0 22 * * 5"  # Friday 10pm
+  #     duration: 60h  # Until Monday 6am
+  #     applications:
+  #       - "*"

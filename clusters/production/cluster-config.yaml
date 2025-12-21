@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-config
+  namespace: argocd
+data:
+  cluster.name: "production"
+  cluster.environment: "production"
+  cluster.region: "us-west-2"

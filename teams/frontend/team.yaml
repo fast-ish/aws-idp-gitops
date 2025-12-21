@@ -1,0 +1,58 @@
+team: frontend
+namespace: team-frontend
+description: "Frontend team - web applications, SSR, and static sites"
+
+owner:
+  name: "Frontend Team"
+  email: frontend@example.com
+  slack: "#frontend-eng"
+
+resourceQuota:
+  requests:
+    cpu: "8"
+    memory: "16Gi"
+  limits:
+    cpu: "16"
+    memory: "32Gi"
+  pods: "30"
+  services: "10"
+  configmaps: "20"
+  secrets: "15"
+  persistentvolumeclaims: "3"
+
+limitRange:
+  default:
+    cpu: "300m"
+    memory: "256Mi"
+  defaultRequest:
+    cpu: "50m"
+    memory: "64Mi"
+  max:
+    cpu: "2"
+    memory: "4Gi"
+
+networkPolicy:
+  allowIngress: true
+  allowEgress: true
+  allowFromNamespaces:
+    - argocd
+    - monitoring
+
+apps:
+  - name: web-app
+    repoURL: https://github.com/fast-ish/web-app
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: admin-dashboard
+    repoURL: https://github.com/fast-ish/admin-dashboard
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: marketing-site
+    repoURL: https://github.com/fast-ish/marketing-site
+    manifestPath: k8s
+    targetRevision: main
+    environment: production

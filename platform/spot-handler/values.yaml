@@ -1,0 +1,71 @@
+# =============================================================================
+# AWS NODE TERMINATION HANDLER
+# =============================================================================
+# Handles spot interruptions and scheduled events gracefully.
+# =============================================================================
+
+# Enable spot interruption handling
+enableSpotInterruptionDraining: true
+
+# Enable rebalance monitoring
+enableRebalanceMonitoring: true
+enableRebalanceDraining: false  # Just monitor, don't auto-drain
+
+# Enable scheduled event handling
+enableScheduledEventDraining: true
+
+# Prometheus metrics
+enablePrometheusServer: true
+prometheusServerPort: 9092
+
+# Only run on spot instances
+nodeSelector:
+  karpenter.sh/capacity-type: spot
+
+# Tolerate all taints to ensure we can run everywhere
+tolerations:
+  - operator: Exists
+
+# Resources
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 100m
+    memory: 128Mi
+
+# Pod Security
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+
+# Webhook for custom handling
+webhookURL: ""
+webhookHeaders: ""
+webhookTemplate: ""
+
+# Logging
+jsonLogging: true
+logLevel: info
+
+# Cordon and drain settings
+taintNode: true
+cordonOnly: false
+deleteLocalData: true
+ignoreDaemonSets: true
+podTerminationGracePeriod: 30
+
+# Emit Kubernetes events
+emitKubernetesEvents: true
+
+# ServiceMonitor for Prometheus
+serviceMonitor:
+  create: true
+  namespace: kube-system
+  labels:
+    release: kube-prometheus-stack

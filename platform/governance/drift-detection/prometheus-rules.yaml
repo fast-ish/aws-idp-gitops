@@ -1,0 +1,131 @@
+# =============================================================================
+# DRIFT DETECTION ALERTS
+# =============================================================================
+# Detects when cluster state differs from GitOps definition.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: drift-detection-rules
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: drift-detection
+    app.kubernetes.io/component: alerting
+    app.kubernetes.io/part-of: governance
+    prometheus: main
+spec:
+  groups:
+    - name: drift.detection
+      interval: 30s
+      rules:
+        # Recording rule for drift duration
+        - record: argocd:app:drift_duration_seconds
+          expr: |
+            (
+              time() - argocd_app_info{sync_status="OutOfSync"} * 0
+              + on(name, namespace) group_left()
+              (argocd_app_info{sync_status="OutOfSync"} * time())
+            )
+
+        # Fast drift detection - alert within 5 minutes
+        - alert: GitOpsDriftDetected
+          expr: |
+            argocd_app_info{sync_status="OutOfSync"} == 1
+          for: 5m
+          labels:
+            severity: warning
+            category: governance
+            team: platform
+          annotations:
+            summary: "Drift detected in {{ $labels.name }}"
+            description: "Application {{ $labels.name }} in project {{ $labels.project }} has drifted from Git. Sync status: OutOfSync for 5+ minutes."
+            runbook_url: "https://wiki.internal/runbooks/gitops-drift"
+            dashboard_url: "https://argocd.internal/applications/{{ $labels.name }}"
+
+        # Extended drift - potential manual changes
+        - alert: GitOpsDriftExtended
+          expr: |
+            argocd_app_info{sync_status="OutOfSync"} == 1
+          for: 30m
+          labels:
+            severity: critical
+            category: governance
+            team: platform
+          annotations:
+            summary: "Extended drift detected in {{ $labels.name }}"
+            description: "Application {{ $labels.name }} has been out of sync for 30+ minutes. This may indicate manual changes that need to be committed to Git."
+            action: "Review changes and either sync or commit to Git"
+
+        # Manual change detection (OutOfSync without recent operation)
+        - alert: ManualResourceModification
+          expr: |
+            argocd_app_info{sync_status="OutOfSync"} == 1
+            and
+            argocd_app_info{operation_state=""} == 1
+          for: 2m
+          labels:
+            severity: critical
+            category: governance
+            team: platform
+          annotations:
+            summary: "Manual modification detected in {{ $labels.name }}"
+            description: "Resources in {{ $labels.name }} were modified outside GitOps flow. No recent ArgoCD operation detected."
+            action: "Investigate and remediate - check audit logs"
+
+        # Sync failed
+        - alert: ArgoCDSyncFailed
+          expr: |
+            argocd_app_info{sync_status="OutOfSync", health_status="Degraded"} == 1
+          for: 5m
+          labels:
+            severity: critical
+            category: governance
+            team: platform
+          annotations:
+            summary: "ArgoCD sync failed for {{ $labels.name }}"
+            description: "Application {{ $labels.name }} failed to sync and is in degraded state."
+            runbook_url: "https://wiki.internal/runbooks/argocd-sync-failed"
+
+        # Application health degraded
+        - alert: ArgoCDAppDegraded
+          expr: |
+            argocd_app_info{health_status="Degraded"} == 1
+          for: 10m
+          labels:
+            severity: warning
+            category: governance
+          annotations:
+            summary: "Application {{ $labels.name }} health degraded"
+            description: "Application health status is Degraded for 10+ minutes."
+
+        # Application missing (was synced, now gone)
+        - alert: ArgoCDAppMissing
+          expr: |
+            argocd_app_info{health_status="Missing"} == 1
+          for: 5m
+          labels:
+            severity: critical
+            category: governance
+            team: platform
+          annotations:
+            summary: "Application {{ $labels.name }} resources missing"
+            description: "Some resources for {{ $labels.name }} are missing from the cluster."
+
+    - name: drift.recording
+      interval: 1m
+      rules:
+        # Percentage of apps in sync
+        - record: argocd:apps:sync_ratio
+          expr: |
+            sum(argocd_app_info{sync_status="Synced"}) /
+            count(argocd_app_info)
+
+        # Count of out-of-sync apps by project
+        - record: argocd:apps:out_of_sync_count
+          expr: |
+            count by (project) (argocd_app_info{sync_status="OutOfSync"})
+
+        # Average time to sync
+        - record: argocd:apps:sync_duration_avg
+          expr: |
+            avg(argocd_app_sync_total) by (project)

@@ -1,0 +1,77 @@
+team: data
+namespace: team-data
+description: "Data engineering - ETL pipelines, data APIs, and analytics infrastructure"
+
+owner:
+  name: "Data Team"
+  email: data@example.com
+  slack: "#data-eng"
+
+resourceQuota:
+  requests:
+    cpu: "40"
+    memory: "80Gi"
+  limits:
+    cpu: "80"
+    memory: "160Gi"
+  pods: "40"
+  services: "15"
+  configmaps: "30"
+  secrets: "25"
+  persistentvolumeclaims: "20"
+
+limitRange:
+  default:
+    cpu: "1"
+    memory: "2Gi"
+  defaultRequest:
+    cpu: "200m"
+    memory: "512Mi"
+  max:
+    cpu: "8"
+    memory: "32Gi"
+
+networkPolicy:
+  allowIngress: true
+  allowEgress: true
+  allowFromNamespaces:
+    - team-backend
+    - team-ml
+    - argocd
+    - monitoring
+
+# Node selection for data workloads
+nodeSelector:
+  workload-type: data
+
+# Tolerations for dedicated data nodes
+tolerations:
+  - key: "workload-type"
+    operator: "Equal"
+    value: "data"
+    effect: "NoSchedule"
+
+apps:
+  - name: etl-pipelines
+    repoURL: https://github.com/fast-ish/etl-pipelines
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: data-api
+    repoURL: https://github.com/fast-ish/data-api
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: analytics-service
+    repoURL: https://github.com/fast-ish/analytics-service
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: data-quality
+    repoURL: https://github.com/fast-ish/data-quality
+    manifestPath: k8s
+    targetRevision: main
+    environment: production

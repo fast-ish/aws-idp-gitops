@@ -1,0 +1,84 @@
+# =============================================================================
+# GOLDILOCKS - VPA RECOMMENDATIONS DASHBOARD
+# =============================================================================
+# Provides a dashboard for viewing VPA recommendations.
+# =============================================================================
+
+# Use existing VPA installation
+vpa:
+  enabled: false
+
+# Dashboard Configuration
+dashboard:
+  enabled: true
+  replicaCount: 2
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internal
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/group.name: internal
+    hosts:
+      - host: goldilocks.internal.fasti.sh
+        paths:
+          - path: /
+            pathType: Prefix
+
+  # Pod Security
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# Controller Configuration
+controller:
+  enabled: true
+  replicaCount: 1
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # Only manage namespaces with this label
+  labelSelector:
+    matchLabels:
+      goldilocks.fairwinds.com/enabled: "true"
+
+  # Pod Security
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# Prometheus Metrics
+serviceMonitor:
+  enabled: true
+  namespace: goldilocks
+  additionalLabels:
+    release: kube-prometheus-stack

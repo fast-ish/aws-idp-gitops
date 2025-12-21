@@ -1,0 +1,519 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ci-cd-pipeline
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: ci-cd-pipeline
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+  annotations:
+    description: |
+      Complete CI/CD pipeline: Clone -> Test -> Build -> Scan -> Sign -> Deploy
+      Integrates with ArgoCD for GitOps-based deployments.
+spec:
+  entrypoint: pipeline
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+  podGC:
+    strategy: OnWorkflowSuccess
+    deleteDelayDuration: 5m
+  onExit: exit-handler
+
+  arguments:
+    parameters:
+      # Source
+      - name: repo-url
+        description: Git repository URL
+      - name: revision
+        default: main
+        description: Git revision (branch, tag, or commit SHA)
+
+      # Build
+      - name: dockerfile
+        default: Dockerfile
+        description: Path to Dockerfile
+      - name: context
+        default: "."
+        description: Docker build context
+
+      # Image
+      - name: image-name
+        description: ECR image name (without registry prefix)
+      - name: ecr-registry
+        description: ECR registry URL
+
+      # Test
+      - name: run-tests
+        default: "true"
+        description: Run tests before build
+      - name: test-image
+        default: node:20-alpine
+        description: Image for running tests
+      - name: test-command
+        default: "npm ci && npm test"
+        description: Test command
+
+      # Security
+      - name: scan-image
+        default: "true"
+        description: Run vulnerability scan
+      - name: sign-image
+        default: "true"
+        description: Sign image with Cosign
+      - name: fail-on-vuln
+        default: "false"
+        description: Fail on critical vulnerabilities
+
+      # Deploy
+      - name: deploy-enabled
+        default: "true"
+        description: Deploy after successful build
+      - name: argocd-app-name
+        description: ArgoCD application name
+      - name: gitops-path
+        description: Path in GitOps repo to update
+
+      # Notification
+      - name: notify-slack
+        default: "true"
+        description: Send Slack notifications
+
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+
+  templates:
+    - name: pipeline
+      dag:
+        tasks:
+          # Clone repository
+          - name: clone
+            template: git-clone
+            arguments:
+              parameters:
+                - name: repo-url
+                  value: "{{workflow.parameters.repo-url}}"
+                - name: revision
+                  value: "{{workflow.parameters.revision}}"
+
+          # Run tests (optional)
+          - name: test
+            template: run-tests
+            when: "{{workflow.parameters.run-tests}} == true"
+            dependencies: [clone]
+            arguments:
+              parameters:
+                - name: test-image
+                  value: "{{workflow.parameters.test-image}}"
+                - name: test-command
+                  value: "{{workflow.parameters.test-command}}"
+
+          # Build image
+          - name: build
+            template: kaniko-build
+            dependencies: [clone, test]
+            arguments:
+              parameters:
+                - name: image-name
+                  value: "{{workflow.parameters.ecr-registry}}/{{workflow.parameters.image-name}}"
+                - name: dockerfile
+                  value: "{{workflow.parameters.dockerfile}}"
+                - name: context
+                  value: "{{workflow.parameters.context}}"
+
+          # Vulnerability scan (optional)
+          - name: scan
+            template: trivy-scan
+            when: "{{workflow.parameters.scan-image}} == true"
+            dependencies: [build]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.ecr-registry}}/{{workflow.parameters.image-name}}:{{workflow.parameters.revision}}"
+                - name: fail-on-vuln
+                  value: "{{workflow.parameters.fail-on-vuln}}"
+
+          # Generate SBOM
+          - name: sbom
+            template: generate-sbom
+            when: "{{workflow.parameters.sign-image}} == true"
+            dependencies: [build]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.ecr-registry}}/{{workflow.parameters.image-name}}:{{workflow.parameters.revision}}"
+
+          # Sign image (optional)
+          - name: sign
+            template: cosign-sign
+            when: "{{workflow.parameters.sign-image}} == true"
+            dependencies: [scan, sbom]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.ecr-registry}}/{{workflow.parameters.image-name}}:{{workflow.parameters.revision}}"
+
+          # Deploy via ArgoCD (optional)
+          - name: deploy
+            template: argocd-deploy
+            when: "{{workflow.parameters.deploy-enabled}} == true"
+            dependencies: [build, scan]
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.argocd-app-name}}"
+                - name: gitops-path
+                  value: "{{workflow.parameters.gitops-path}}"
+                - name: image-tag
+                  value: "{{workflow.parameters.revision}}"
+
+          # Notify on success
+          - name: notify-success
+            template: slack-notify
+            when: "{{workflow.parameters.notify-slack}} == true"
+            dependencies: [deploy]
+            arguments:
+              parameters:
+                - name: status
+                  value: "success"
+                - name: message
+                  value: "Pipeline completed successfully for {{workflow.parameters.image-name}}:{{workflow.parameters.revision}}"
+
+    # Exit handler for failures
+    - name: exit-handler
+      steps:
+        - - name: notify-failure
+            template: slack-notify
+            when: "{{workflow.status}} != Succeeded && {{workflow.parameters.notify-slack}} == true"
+            arguments:
+              parameters:
+                - name: status
+                  value: "failure"
+                - name: message
+                  value: "Pipeline failed for {{workflow.parameters.image-name}}"
+
+    # Git clone template
+    - name: git-clone
+      inputs:
+        parameters:
+          - name: repo-url
+          - name: revision
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Cloning {{inputs.parameters.repo-url}} at {{inputs.parameters.revision}}"
+            git clone --depth 1 --branch {{inputs.parameters.revision}} \
+              {{inputs.parameters.repo-url}} /work/src
+
+            cd /work/src
+            echo "COMMIT_SHA=$(git rev-parse HEAD)" > /work/build-info
+            echo "COMMIT_SHORT=$(git rev-parse --short HEAD)" >> /work/build-info
+            cat /work/build-info
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    # Run tests template
+    - name: run-tests
+      inputs:
+        parameters:
+          - name: test-image
+          - name: test-command
+      container:
+        image: "{{inputs.parameters.test-image}}"
+        command: [sh, -c]
+        args:
+          - |
+            cd /work/src
+            echo "Running tests..."
+            {{inputs.parameters.test-command}}
+            echo "Tests passed!"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+    # Kaniko build template
+    - name: kaniko-build
+      inputs:
+        parameters:
+          - name: image-name
+          - name: dockerfile
+          - name: context
+      container:
+        image: gcr.io/kaniko-project/executor:v1.23.2
+        args:
+          - --dockerfile=/work/src/{{inputs.parameters.context}}/{{inputs.parameters.dockerfile}}
+          - --context=/work/src/{{inputs.parameters.context}}
+          - --destination={{inputs.parameters.image-name}}:{{workflow.parameters.revision}}
+          - --destination={{inputs.parameters.image-name}}:latest
+          - --cache=true
+          - --cache-repo={{inputs.parameters.image-name}}-cache
+          - --snapshot-mode=redo
+          - --use-new-run
+          - --digest-file=/work/image-digest
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+    # Trivy scan template
+    - name: trivy-scan
+      inputs:
+        parameters:
+          - name: image
+          - name: fail-on-vuln
+      outputs:
+        artifacts:
+          - name: trivy-report
+            path: /work/trivy-report.json
+            archive:
+              none: {}
+      container:
+        image: aquasec/trivy:0.48.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Scanning image: {{inputs.parameters.image}}"
+
+            trivy image \
+              --severity HIGH,CRITICAL \
+              --format json \
+              --output /work/trivy-report.json \
+              --ignore-unfixed \
+              {{inputs.parameters.image}}
+
+            trivy image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              {{inputs.parameters.image}}
+
+            CRITICAL_COUNT=$(cat /work/trivy-report.json | jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length')
+            echo "Found $CRITICAL_COUNT critical vulnerabilities"
+
+            if [ "{{inputs.parameters.fail-on-vuln}}" = "true" ] && [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "ERROR: Critical vulnerabilities found"
+              exit 1
+            fi
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+
+    # SBOM generation template
+    - name: generate-sbom
+      inputs:
+        parameters:
+          - name: image
+      outputs:
+        artifacts:
+          - name: sbom
+            path: /work/sbom.spdx.json
+            archive:
+              none: {}
+      container:
+        image: anchore/syft:v0.98.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Generating SBOM for: {{inputs.parameters.image}}"
+            syft {{inputs.parameters.image}} \
+              -o spdx-json=/work/sbom.spdx.json
+            echo "SBOM generated"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+
+    # Cosign sign template
+    - name: cosign-sign
+      inputs:
+        parameters:
+          - name: image
+      container:
+        image: gcr.io/projectsigstore/cosign:v2.2.2
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Signing image: {{inputs.parameters.image}}"
+
+            cosign sign \
+              --key awskms:///${KMS_KEY_ARN} \
+              --tlog-upload=false \
+              {{inputs.parameters.image}}
+
+            if [ -f /work/sbom.spdx.json ]; then
+              echo "Attaching SBOM attestation..."
+              cosign attest \
+                --key awskms:///${KMS_KEY_ARN} \
+                --predicate /work/sbom.spdx.json \
+                --type spdxjson \
+                --tlog-upload=false \
+                {{inputs.parameters.image}}
+            fi
+
+            echo "Image signed successfully"
+        env:
+          - name: AWS_REGION
+            value: us-west-2
+          - name: KMS_KEY_ARN
+            valueFrom:
+              secretKeyRef:
+                name: cosign-kms
+                key: kms_key_arn
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+    # ArgoCD deploy template
+    - name: argocd-deploy
+      inputs:
+        parameters:
+          - name: app-name
+          - name: gitops-path
+          - name: image-tag
+      container:
+        image: quay.io/argoproj/argocd:v2.12.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+
+            echo "Logging into ArgoCD..."
+            argocd login $ARGOCD_SERVER \
+              --username admin \
+              --password $ARGOCD_PASSWORD \
+              --insecure
+
+            echo "Updating application {{inputs.parameters.app-name}} to use tag {{inputs.parameters.image-tag}}"
+
+            # Trigger refresh and sync
+            argocd app set {{inputs.parameters.app-name}} \
+              --kustomize-image *={{inputs.parameters.image-tag}} || true
+
+            argocd app sync {{inputs.parameters.app-name}} \
+              --prune \
+              --timeout 120
+
+            echo "Waiting for application to be healthy..."
+            argocd app wait {{inputs.parameters.app-name}} \
+              --health \
+              --timeout 300
+
+            echo "Deployment complete!"
+            argocd app get {{inputs.parameters.app-name}}
+        env:
+          - name: ARGOCD_SERVER
+            valueFrom:
+              secretKeyRef:
+                name: argocd-credentials
+                key: server
+          - name: ARGOCD_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: argocd-credentials
+                key: password
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    # Slack notification template
+    - name: slack-notify
+      inputs:
+        parameters:
+          - name: status
+          - name: message
+      container:
+        image: curlimages/curl:8.5.0
+        command: [sh, -c]
+        args:
+          - |
+            COLOR="#36a64f"
+            if [ "{{inputs.parameters.status}}" = "failure" ]; then
+              COLOR="#dc3545"
+            fi
+
+            curl -X POST $SLACK_WEBHOOK_URL \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"attachments\": [{
+                  \"color\": \"$COLOR\",
+                  \"title\": \"CI/CD Pipeline {{inputs.parameters.status}}\",
+                  \"text\": \"{{inputs.parameters.message}}\",
+                  \"fields\": [
+                    {\"title\": \"Workflow\", \"value\": \"{{workflow.name}}\", \"short\": true},
+                    {\"title\": \"Status\", \"value\": \"{{inputs.parameters.status}}\", \"short\": true}
+                  ]
+                }]
+              }" || true
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook
+                key: url
+                optional: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi

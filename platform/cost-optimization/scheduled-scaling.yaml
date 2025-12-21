@@ -1,0 +1,506 @@
+# =============================================================================
+# COST OPTIMIZATION - SCHEDULED SCALING
+# =============================================================================
+# Scales down non-production environments during off-hours and weekends.
+# Uses Kubernetes CronJobs and Argo Workflows for flexible scheduling.
+#
+# Default Schedule (US Pacific):
+# - Scale down: Weekdays 8 PM, Weekends all day
+# - Scale up: Weekdays 6 AM
+# - Preview envs: Always scale down after 2 hours of inactivity
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cost-optimization
+  labels:
+    app.kubernetes.io/name: cost-optimization
+    app.kubernetes.io/component: scheduler
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cost-optimizer
+  namespace: cost-optimization
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cost-optimizer
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["rollouts", "rollouts/scale"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cost-optimizer
+subjects:
+  - kind: ServiceAccount
+    name: cost-optimizer
+    namespace: cost-optimization
+roleRef:
+  kind: ClusterRole
+  name: cost-optimizer
+  apiGroup: rbac.authorization.k8s.io
+---
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scaling-config
+  namespace: cost-optimization
+data:
+  # Environments to scale (comma-separated namespace patterns)
+  target-environments: "dev,staging,preview-*"
+
+  # Exclude these namespaces from scaling
+  excluded-namespaces: "prod,kube-system,argocd,monitoring"
+
+  # Minimum replicas during off-hours (0 = complete shutdown)
+  off-hours-min-replicas: "0"
+
+  # Business hours configuration (UTC)
+  # Format: HH:MM-HH:MM (24-hour)
+  business-hours-start: "14:00"  # 6 AM Pacific
+  business-hours-end: "04:00"    # 8 PM Pacific
+
+  # Working days (0 = Sunday, 6 = Saturday)
+  working-days: "1,2,3,4,5"
+
+  # Preview environment TTL (hours)
+  preview-ttl-hours: "2"
+---
+# =============================================================================
+# SCALE DOWN CRONJOB - WEEKDAY EVENINGS
+# =============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-down-evenings
+  namespace: cost-optimization
+  labels:
+    app.kubernetes.io/name: scheduled-scaling
+    app.kubernetes.io/component: scale-down
+spec:
+  # 8 PM Pacific (4 AM UTC next day) Monday-Friday
+  schedule: "0 4 * * 2-6"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cost-optimizer
+          restartPolicy: OnFailure
+          containers:
+            - name: scaler
+              image: bitnami/kubectl:1.29
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  #!/bin/bash
+                  set -e
+
+                  echo "=== Scale Down - Evening ==="
+                  echo "Time: $(date -u)"
+
+                  # Get configuration
+                  TARGET_ENVS=$(kubectl get configmap scaling-config -n cost-optimization -o jsonpath='{.data.target-environments}')
+                  EXCLUDED=$(kubectl get configmap scaling-config -n cost-optimization -o jsonpath='{.data.excluded-namespaces}')
+                  MIN_REPLICAS=$(kubectl get configmap scaling-config -n cost-optimization -o jsonpath='{.data.off-hours-min-replicas}')
+
+                  echo "Target patterns: $TARGET_ENVS"
+                  echo "Excluded: $EXCLUDED"
+                  echo "Min replicas: $MIN_REPLICAS"
+
+                  # Get all namespaces
+                  for pattern in $(echo "$TARGET_ENVS" | tr ',' ' '); do
+                    for ns in $(kubectl get namespaces -o name | grep -E "namespace/${pattern}" | cut -d/ -f2); do
+                      # Check if excluded
+                      if echo "$EXCLUDED" | grep -qw "$ns"; then
+                        echo "Skipping excluded namespace: $ns"
+                        continue
+                      fi
+
+                      echo "Processing namespace: $ns"
+
+                      # Save current replica counts before scaling
+                      kubectl get deployments -n "$ns" -o json | \
+                        jq -c '.items[] | {name: .metadata.name, replicas: .spec.replicas}' | \
+                        while read -r dep; do
+                          DEP_NAME=$(echo "$dep" | jq -r '.name')
+                          REPLICAS=$(echo "$dep" | jq -r '.replicas')
+
+                          # Store original replica count in annotation
+                          kubectl annotate deployment "$DEP_NAME" -n "$ns" \
+                            fasti.sh/original-replicas="$REPLICAS" \
+                            --overwrite 2>/dev/null || true
+
+                          # Scale down
+                          echo "  Scaling $DEP_NAME: $REPLICAS → $MIN_REPLICAS"
+                          kubectl scale deployment "$DEP_NAME" -n "$ns" --replicas="$MIN_REPLICAS"
+                        done
+
+                      # Handle Argo Rollouts
+                      kubectl get rollouts -n "$ns" -o json 2>/dev/null | \
+                        jq -c '.items[] | {name: .metadata.name, replicas: .spec.replicas}' | \
+                        while read -r ro; do
+                          RO_NAME=$(echo "$ro" | jq -r '.name')
+                          REPLICAS=$(echo "$ro" | jq -r '.replicas')
+
+                          kubectl annotate rollout "$RO_NAME" -n "$ns" \
+                            fasti.sh/original-replicas="$REPLICAS" \
+                            --overwrite 2>/dev/null || true
+
+                          echo "  Scaling rollout $RO_NAME: $REPLICAS → $MIN_REPLICAS"
+                          kubectl patch rollout "$RO_NAME" -n "$ns" \
+                            --type merge \
+                            -p "{\"spec\":{\"replicas\":$MIN_REPLICAS}}"
+                        done
+                    done
+                  done
+
+                  echo "Scale down complete"
+---
+# =============================================================================
+# SCALE DOWN CRONJOB - WEEKENDS
+# =============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-down-weekend
+  namespace: cost-optimization
+  labels:
+    app.kubernetes.io/name: scheduled-scaling
+    app.kubernetes.io/component: scale-down
+spec:
+  # Friday 8 PM Pacific (Saturday 4 AM UTC)
+  schedule: "0 4 * * 6"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cost-optimizer
+          restartPolicy: OnFailure
+          containers:
+            - name: scaler
+              image: bitnami/kubectl:1.29
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  #!/bin/bash
+                  set -e
+
+                  echo "=== Scale Down - Weekend ==="
+                  echo "Time: $(date -u)"
+
+                  # Same logic as evening scale-down
+                  TARGET_ENVS=$(kubectl get configmap scaling-config -n cost-optimization -o jsonpath='{.data.target-environments}')
+                  EXCLUDED=$(kubectl get configmap scaling-config -n cost-optimization -o jsonpath='{.data.excluded-namespaces}')
+                  MIN_REPLICAS=$(kubectl get configmap scaling-config -n cost-optimization -o jsonpath='{.data.off-hours-min-replicas}')
+
+                  for pattern in $(echo "$TARGET_ENVS" | tr ',' ' '); do
+                    for ns in $(kubectl get namespaces -o name | grep -E "namespace/${pattern}" | cut -d/ -f2); do
+                      if echo "$EXCLUDED" | grep -qw "$ns"; then
+                        continue
+                      fi
+
+                      echo "Processing namespace: $ns"
+
+                      # Scale deployments
+                      for dep in $(kubectl get deployments -n "$ns" -o name 2>/dev/null); do
+                        DEP_NAME=$(echo "$dep" | cut -d/ -f2)
+                        CURRENT=$(kubectl get deployment "$DEP_NAME" -n "$ns" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+
+                        if [ "$CURRENT" != "$MIN_REPLICAS" ]; then
+                          kubectl annotate deployment "$DEP_NAME" -n "$ns" \
+                            fasti.sh/original-replicas="$CURRENT" --overwrite 2>/dev/null || true
+                          kubectl scale deployment "$DEP_NAME" -n "$ns" --replicas="$MIN_REPLICAS"
+                          echo "  Scaled $DEP_NAME: $CURRENT → $MIN_REPLICAS"
+                        fi
+                      done
+
+                      # Scale rollouts
+                      for ro in $(kubectl get rollouts -n "$ns" -o name 2>/dev/null); do
+                        RO_NAME=$(echo "$ro" | cut -d/ -f2)
+                        CURRENT=$(kubectl get rollout "$RO_NAME" -n "$ns" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+
+                        if [ "$CURRENT" != "$MIN_REPLICAS" ]; then
+                          kubectl annotate rollout "$RO_NAME" -n "$ns" \
+                            fasti.sh/original-replicas="$CURRENT" --overwrite 2>/dev/null || true
+                          kubectl patch rollout "$RO_NAME" -n "$ns" \
+                            --type merge -p "{\"spec\":{\"replicas\":$MIN_REPLICAS}}"
+                          echo "  Scaled rollout $RO_NAME: $CURRENT → $MIN_REPLICAS"
+                        fi
+                      done
+                    done
+                  done
+
+                  echo "Weekend scale down complete"
+---
+# =============================================================================
+# SCALE UP CRONJOB - WEEKDAY MORNINGS
+# =============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-up-mornings
+  namespace: cost-optimization
+  labels:
+    app.kubernetes.io/name: scheduled-scaling
+    app.kubernetes.io/component: scale-up
+spec:
+  # 6 AM Pacific (2 PM UTC) Monday-Friday
+  schedule: "0 14 * * 1-5"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cost-optimizer
+          restartPolicy: OnFailure
+          containers:
+            - name: scaler
+              image: bitnami/kubectl:1.29
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  #!/bin/bash
+                  set -e
+
+                  echo "=== Scale Up - Morning ==="
+                  echo "Time: $(date -u)"
+
+                  TARGET_ENVS=$(kubectl get configmap scaling-config -n cost-optimization -o jsonpath='{.data.target-environments}')
+                  EXCLUDED=$(kubectl get configmap scaling-config -n cost-optimization -o jsonpath='{.data.excluded-namespaces}')
+
+                  for pattern in $(echo "$TARGET_ENVS" | tr ',' ' '); do
+                    for ns in $(kubectl get namespaces -o name | grep -E "namespace/${pattern}" | cut -d/ -f2); do
+                      if echo "$EXCLUDED" | grep -qw "$ns"; then
+                        continue
+                      fi
+
+                      # Skip preview namespaces - they have their own lifecycle
+                      if echo "$ns" | grep -q "^preview-"; then
+                        echo "Skipping preview namespace: $ns"
+                        continue
+                      fi
+
+                      echo "Processing namespace: $ns"
+
+                      # Restore deployments
+                      for dep in $(kubectl get deployments -n "$ns" -o name 2>/dev/null); do
+                        DEP_NAME=$(echo "$dep" | cut -d/ -f2)
+                        ORIGINAL=$(kubectl get deployment "$DEP_NAME" -n "$ns" \
+                          -o jsonpath='{.metadata.annotations.fasti\.sh/original-replicas}' 2>/dev/null || echo "")
+
+                        if [ -n "$ORIGINAL" ] && [ "$ORIGINAL" != "0" ]; then
+                          kubectl scale deployment "$DEP_NAME" -n "$ns" --replicas="$ORIGINAL"
+                          echo "  Restored $DEP_NAME to $ORIGINAL replicas"
+                        else
+                          # Default to 1 if no annotation
+                          kubectl scale deployment "$DEP_NAME" -n "$ns" --replicas=1
+                          echo "  Restored $DEP_NAME to 1 replica (default)"
+                        fi
+                      done
+
+                      # Restore rollouts
+                      for ro in $(kubectl get rollouts -n "$ns" -o name 2>/dev/null); do
+                        RO_NAME=$(echo "$ro" | cut -d/ -f2)
+                        ORIGINAL=$(kubectl get rollout "$RO_NAME" -n "$ns" \
+                          -o jsonpath='{.metadata.annotations.fasti\.sh/original-replicas}' 2>/dev/null || echo "")
+
+                        if [ -n "$ORIGINAL" ] && [ "$ORIGINAL" != "0" ]; then
+                          kubectl patch rollout "$RO_NAME" -n "$ns" \
+                            --type merge -p "{\"spec\":{\"replicas\":$ORIGINAL}}"
+                          echo "  Restored rollout $RO_NAME to $ORIGINAL replicas"
+                        else
+                          kubectl patch rollout "$RO_NAME" -n "$ns" \
+                            --type merge -p '{"spec":{"replicas":1}}'
+                          echo "  Restored rollout $RO_NAME to 1 replica (default)"
+                        fi
+                      done
+                    done
+                  done
+
+                  echo "Scale up complete"
+---
+# =============================================================================
+# PREVIEW ENVIRONMENT CLEANUP
+# =============================================================================
+# Cleans up preview environments based on TTL and inactivity
+# =============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup-previews
+  namespace: cost-optimization
+  labels:
+    app.kubernetes.io/name: scheduled-scaling
+    app.kubernetes.io/component: cleanup
+spec:
+  # Run every hour
+  schedule: "0 * * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cost-optimizer
+          restartPolicy: OnFailure
+          containers:
+            - name: cleaner
+              image: bitnami/kubectl:1.29
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  #!/bin/bash
+                  set -e
+
+                  echo "=== Preview Environment Cleanup ==="
+                  echo "Time: $(date -u)"
+
+                  TTL_HOURS=$(kubectl get configmap scaling-config -n cost-optimization \
+                    -o jsonpath='{.data.preview-ttl-hours}' 2>/dev/null || echo "72")
+
+                  echo "TTL: $TTL_HOURS hours"
+
+                  NOW=$(date +%s)
+
+                  # Find preview namespaces
+                  for ns in $(kubectl get namespaces -l fasti.sh/preview=true -o name 2>/dev/null | cut -d/ -f2); do
+                    echo "Checking: $ns"
+
+                    # Get creation time from configmap
+                    CREATED_AT=$(kubectl get configmap preview-metadata -n "$ns" \
+                      -o jsonpath='{.metadata.annotations.fasti\.sh/created-at}' 2>/dev/null || echo "")
+
+                    if [ -z "$CREATED_AT" ]; then
+                      # Fallback to namespace creation time
+                      CREATED_AT=$(kubectl get namespace "$ns" \
+                        -o jsonpath='{.metadata.creationTimestamp}')
+                    fi
+
+                    if [ -z "$CREATED_AT" ]; then
+                      echo "  Could not determine creation time, skipping"
+                      continue
+                    fi
+
+                    # Calculate age
+                    CREATED_EPOCH=$(date -d "$CREATED_AT" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%SZ" "$CREATED_AT" +%s 2>/dev/null || echo "0")
+                    AGE_HOURS=$(( (NOW - CREATED_EPOCH) / 3600 ))
+
+                    echo "  Age: $AGE_HOURS hours (TTL: $TTL_HOURS hours)"
+
+                    if [ "$AGE_HOURS" -gt "$TTL_HOURS" ]; then
+                      echo "  ⚠ Namespace $ns has exceeded TTL"
+
+                      # Get PR number for notification
+                      PR_NUMBER=$(kubectl get configmap preview-metadata -n "$ns" \
+                        -o jsonpath='{.data.prNumber}' 2>/dev/null || echo "unknown")
+
+                      echo "  Deleting namespace: $ns (PR #$PR_NUMBER)"
+
+                      # Delete the namespace (ArgoCD will clean up the Application)
+                      kubectl delete namespace "$ns" --wait=false
+
+                      echo "  ✓ Namespace scheduled for deletion"
+                    else
+                      REMAINING=$((TTL_HOURS - AGE_HOURS))
+                      echo "  ✓ OK ($REMAINING hours remaining)"
+                    fi
+                  done
+
+                  echo "Cleanup complete"
+---
+# =============================================================================
+# COST REPORT WORKFLOW
+# =============================================================================
+# Generates weekly cost report for non-prod environments
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: cost-report
+  namespace: argo
+spec:
+  # Every Monday at 9 AM UTC
+  schedule: "0 9 * * 1"
+  timezone: "UTC"
+  concurrencyPolicy: Forbid
+  workflowSpec:
+    entrypoint: generate-report
+    serviceAccountName: argo-workflow
+    templates:
+      - name: generate-report
+        script:
+          image: bitnami/kubectl:1.29
+          command: [bash]
+          source: |
+            #!/bin/bash
+            set -e
+
+            echo "=== Weekly Cost Report ==="
+            echo "Generated: $(date -u)"
+            echo ""
+
+            echo "## Namespace Summary"
+            echo ""
+
+            # Get all non-prod namespaces
+            for ns in $(kubectl get namespaces -o name | grep -E "(dev|staging|preview)" | cut -d/ -f2); do
+              echo "### $ns"
+
+              # Count resources
+              PODS=$(kubectl get pods -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              DEPLOYMENTS=$(kubectl get deployments -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              ROLLOUTS=$(kubectl get rollouts -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+
+              echo "- Pods: $PODS"
+              echo "- Deployments: $DEPLOYMENTS"
+              echo "- Rollouts: $ROLLOUTS"
+
+              # Get resource requests if metrics available
+              if kubectl top pods -n "$ns" &>/dev/null; then
+                echo "- Resource Usage:"
+                kubectl top pods -n "$ns" 2>/dev/null | tail -n +2 | awk '{print "  - " $1 ": CPU=" $2 ", Memory=" $3}'
+              fi
+
+              echo ""
+            done
+
+            echo "## Scaling Events This Week"
+            echo ""
+
+            # List recent scaling jobs
+            kubectl get jobs -n cost-optimization \
+              --sort-by='.metadata.creationTimestamp' \
+              -o custom-columns='NAME:.metadata.name,COMPLETED:.status.succeeded,TIME:.metadata.creationTimestamp' | tail -20
+
+            echo ""
+            echo "=== End Report ==="

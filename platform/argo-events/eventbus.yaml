@@ -1,0 +1,40 @@
+apiVersion: argoproj.io/v1alpha1
+kind: EventBus
+metadata:
+  name: default
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: default-eventbus
+    app.kubernetes.io/component: eventbus
+    app.kubernetes.io/part-of: argo-events
+spec:
+  jetstream:
+    version: latest
+    replicas: 3
+    persistence:
+      storageClassName: default-ebs
+      accessMode: ReadWriteOnce
+      volumeSize: 10Gi
+    containerTemplate:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    metricsContainerTemplate:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+    settings: |
+      max_file_store: 1GB
+      max_memory_store: 256MB
+    streamConfig: |
+      maxAge: 72h
+      maxMsgs: 100000
+      replicas: 3

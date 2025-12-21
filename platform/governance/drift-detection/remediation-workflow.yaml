@@ -1,0 +1,361 @@
+# =============================================================================
+# DRIFT REMEDIATION WORKFLOW
+# =============================================================================
+# Argo Workflow for auto-remediating GitOps drift.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: drift-remediation
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: drift-remediation
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: governance
+spec:
+  entrypoint: remediate-drift
+  serviceAccountName: argo-workflow
+  arguments:
+    parameters:
+      - name: app-name
+        description: "ArgoCD application name"
+      - name: auto-sync
+        description: "Automatically sync to remediate drift"
+        default: "false"
+      - name: notify-channel
+        description: "Slack channel for notifications"
+        default: "#platform-alerts"
+
+  templates:
+    # =========================================================================
+    # MAIN REMEDIATION WORKFLOW
+    # =========================================================================
+    - name: remediate-drift
+      dag:
+        tasks:
+          # Get current drift details
+          - name: detect-changes
+            template: get-drift-diff
+
+          # Get application info
+          - name: get-app-info
+            template: get-app-info
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+
+          # Notify about drift
+          - name: notify-drift
+            template: slack-notify
+            dependencies: [detect-changes, get-app-info]
+            arguments:
+              parameters:
+                - name: message
+                  value: "Drift detected in {{workflow.parameters.app-name}}"
+                - name: diff
+                  value: "{{tasks.detect-changes.outputs.parameters.diff}}"
+                - name: channel
+                  value: "{{workflow.parameters.notify-channel}}"
+
+          # Auto-remediate if enabled
+          - name: auto-sync
+            template: argocd-sync
+            dependencies: [notify-drift]
+            when: "{{workflow.parameters.auto-sync}} == true"
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+
+          # Verify sync
+          - name: verify-sync
+            template: verify-sync
+            dependencies: [auto-sync]
+            when: "{{workflow.parameters.auto-sync}} == true"
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+
+          # Final notification
+          - name: notify-complete
+            template: slack-notify
+            dependencies: [verify-sync]
+            when: "{{workflow.parameters.auto-sync}} == true"
+            arguments:
+              parameters:
+                - name: message
+                  value: "Drift remediation completed for {{workflow.parameters.app-name}}"
+                - name: channel
+                  value: "{{workflow.parameters.notify-channel}}"
+
+    # =========================================================================
+    # GET DRIFT DIFF
+    # =========================================================================
+    - name: get-drift-diff
+      outputs:
+        parameters:
+          - name: diff
+            valueFrom:
+              path: /tmp/diff.txt
+      script:
+        image: quay.io/argoproj/argocd:v2.10.0
+        env:
+          - name: ARGOCD_SERVER
+            value: argocd-server.argocd.svc.cluster.local
+          - name: ARGOCD_AUTH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: argocd-token
+                key: token
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP_NAME="{{workflow.parameters.app-name}}"
+
+          echo "Getting drift diff for $APP_NAME"
+
+          # Get app diff
+          argocd app diff "$APP_NAME" \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            --grpc-web \
+            --insecure 2>&1 > /tmp/diff.txt || true
+
+          # If diff is empty, app is in sync
+          if [ ! -s /tmp/diff.txt ]; then
+            echo "No drift detected" > /tmp/diff.txt
+          fi
+
+          echo "Diff:"
+          cat /tmp/diff.txt
+
+    # =========================================================================
+    # GET APP INFO
+    # =========================================================================
+    - name: get-app-info
+      inputs:
+        parameters:
+          - name: app-name
+      outputs:
+        parameters:
+          - name: app-info
+            valueFrom:
+              path: /tmp/app-info.json
+      script:
+        image: quay.io/argoproj/argocd:v2.10.0
+        env:
+          - name: ARGOCD_SERVER
+            value: argocd-server.argocd.svc.cluster.local
+          - name: ARGOCD_AUTH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: argocd-token
+                key: token
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP_NAME="{{inputs.parameters.app-name}}"
+
+          argocd app get "$APP_NAME" \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            --grpc-web \
+            --insecure \
+            -o json > /tmp/app-info.json
+
+          echo "App Info:"
+          jq '.' /tmp/app-info.json
+
+    # =========================================================================
+    # ARGOCD SYNC
+    # =========================================================================
+    - name: argocd-sync
+      inputs:
+        parameters:
+          - name: app-name
+      script:
+        image: quay.io/argoproj/argocd:v2.10.0
+        env:
+          - name: ARGOCD_SERVER
+            value: argocd-server.argocd.svc.cluster.local
+          - name: ARGOCD_AUTH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: argocd-token
+                key: token
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP_NAME="{{inputs.parameters.app-name}}"
+
+          echo "Syncing application: $APP_NAME"
+
+          argocd app sync "$APP_NAME" \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            --grpc-web \
+            --insecure \
+            --prune \
+            --timeout 300
+
+          echo "Sync initiated"
+
+    # =========================================================================
+    # VERIFY SYNC
+    # =========================================================================
+    - name: verify-sync
+      inputs:
+        parameters:
+          - name: app-name
+      script:
+        image: quay.io/argoproj/argocd:v2.10.0
+        env:
+          - name: ARGOCD_SERVER
+            value: argocd-server.argocd.svc.cluster.local
+          - name: ARGOCD_AUTH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: argocd-token
+                key: token
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP_NAME="{{inputs.parameters.app-name}}"
+
+          echo "Waiting for sync to complete: $APP_NAME"
+
+          argocd app wait "$APP_NAME" \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            --grpc-web \
+            --insecure \
+            --timeout 600 \
+            --sync \
+            --health
+
+          echo "Sync verified successfully"
+
+    # =========================================================================
+    # SLACK NOTIFICATION
+    # =========================================================================
+    - name: slack-notify
+      inputs:
+        parameters:
+          - name: message
+          - name: channel
+          - name: diff
+            default: ""
+      script:
+        image: curlimages/curl:8.5.0
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook
+                key: url
+                optional: true
+        command: [sh]
+        source: |
+          #!/bin/sh
+
+          MESSAGE="{{inputs.parameters.message}}"
+          CHANNEL="{{inputs.parameters.channel}}"
+          DIFF="{{inputs.parameters.diff}}"
+
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "Slack not configured"
+            echo "Message: $MESSAGE"
+            exit 0
+          fi
+
+          # Truncate diff if too long
+          if [ ${#DIFF} -gt 500 ]; then
+            DIFF="${DIFF:0:500}..."
+          fi
+
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"channel\": \"${CHANNEL}\",
+              \"attachments\": [{
+                \"color\": \"warning\",
+                \"blocks\": [
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"🔄 *GitOps Drift Alert*\\n${MESSAGE}\"
+                    }
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"\`\`\`${DIFF}\`\`\`\"
+                    }
+                  }
+                ]
+              }]
+            }"
+---
+# =============================================================================
+# DRIFT DETECTION SENSOR
+# =============================================================================
+# Triggers remediation workflow when drift is detected
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: drift-detection-sensor
+  namespace: argo-events
+spec:
+  template:
+    serviceAccountName: argo-events-sa
+  dependencies:
+    - name: drift-alert
+      eventSourceName: webhook
+      eventName: alertmanager
+      filters:
+        data:
+          - path: body.alerts.0.labels.alertname
+            type: string
+            value:
+              - "GitOpsDriftDetected"
+              - "GitOpsDriftExtended"
+  triggers:
+    - template:
+        name: trigger-drift-remediation
+        conditions: "drift-alert"
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: drift-remediation-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: drift-remediation
+                arguments:
+                  parameters:
+                    - name: app-name
+                      value: ""
+                    - name: auto-sync
+                      value: "false"  # Require manual approval by default
+          parameters:
+            - src:
+                dependencyName: drift-alert
+                dataKey: body.alerts.0.labels.name
+              dest: spec.arguments.parameters.0.value

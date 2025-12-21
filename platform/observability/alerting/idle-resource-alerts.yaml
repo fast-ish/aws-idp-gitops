@@ -1,0 +1,170 @@
+# =============================================================================
+# IDLE RESOURCE DETECTION ALERTS
+# =============================================================================
+# Detects unused or abandoned resources for cleanup.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: idle-resource-alerts
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: idle-resource-alerts
+    app.kubernetes.io/component: alerting
+    app.kubernetes.io/part-of: resource-optimization
+    prometheus: main
+spec:
+  groups:
+    - name: idle.resources
+      interval: 5m
+      rules:
+        # Unused PVCs (not mounted to any pod)
+        - alert: UnusedPVC
+          expr: |
+            kube_persistentvolumeclaim_info{namespace!~"kube-.*|argocd|velero|monitoring"}
+            unless on(namespace, persistentvolumeclaim)
+            kube_pod_spec_volumes_persistentvolumeclaims_info
+          for: 7d
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "PVC {{ $labels.persistentvolumeclaim }} in {{ $labels.namespace }} is not mounted"
+            description: "This PVC has not been mounted to any pod for 7 days. Consider deleting to save storage costs."
+            action: "Review and delete if unused: kubectl delete pvc {{ $labels.persistentvolumeclaim }} -n {{ $labels.namespace }}"
+
+        # Services with no endpoints
+        - alert: ServiceWithNoEndpoints
+          expr: |
+            (
+              kube_service_info{service!~"kubernetes|kube-dns|metrics-server.*", namespace!~"kube-.*"}
+              unless on(namespace, service)
+              (
+                label_replace(
+                  kube_endpoint_address_available,
+                  "service", "$1", "endpoint", "(.*)"
+                ) > 0
+              )
+            )
+          for: 24h
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "Service {{ $labels.service }} in {{ $labels.namespace }} has no endpoints"
+            description: "This service has no backing pods. It may be orphaned or misconfigured."
+
+        # Deployments with zero replicas for extended time
+        - alert: DeploymentScaledToZero
+          expr: |
+            kube_deployment_spec_replicas{namespace=~"team-.*|prod-.*|staging-.*"} == 0
+          for: 7d
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "Deployment {{ $labels.deployment }} in {{ $labels.namespace }} scaled to zero"
+            description: "Deployment has been at zero replicas for 7 days. Consider removing if no longer needed."
+
+        # Orphaned ConfigMaps (not referenced by any pod)
+        - alert: OrphanedConfigMap
+          expr: |
+            kube_configmap_info{
+              configmap!~".*-token-.*|kube-root-ca.crt|.*-ca|.*-config",
+              namespace!~"kube-.*|argocd|monitoring"
+            }
+            unless on(namespace, configmap)
+            kube_pod_spec_volumes_configmaps_info
+          for: 14d
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "ConfigMap {{ $labels.configmap }} in {{ $labels.namespace }} may be unused"
+            description: "ConfigMap not mounted as volume in any pod for 14 days."
+
+        # Orphaned Secrets (not referenced by any pod)
+        - alert: OrphanedSecret
+          expr: |
+            kube_secret_info{
+              type!~"kubernetes.io/service-account-token|helm.sh/release.*|kubernetes.io/dockerconfigjson",
+              namespace!~"kube-.*|argocd|external-secrets"
+            }
+            unless on(namespace, secret)
+            (
+              kube_pod_spec_volumes_secret_info
+              or
+              label_replace(
+                kube_pod_container_info,
+                "secret", "$1", "image_pull_secrets", "(.*)"
+              )
+            )
+          for: 14d
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "Secret {{ $labels.secret }} in {{ $labels.namespace }} may be unused"
+            description: "Secret not referenced by any pod for 14 days."
+
+        # Low traffic services (potential candidates for removal)
+        - alert: LowTrafficService
+          expr: |
+            (
+              sum by (namespace, service) (
+                rate(http_requests_total[24h])
+              ) < 0.001
+            )
+            and
+            (
+              sum by (namespace, service) (
+                rate(http_requests_total[24h] offset 7d)
+              ) > 0.01
+            )
+          for: 7d
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "Service {{ $labels.service }} has very low traffic"
+            description: "Traffic dropped by 90%+ in the last week. Review if still needed."
+
+        # Stale preview environments
+        - alert: StalePreviewEnvironment
+          expr: |
+            kube_namespace_labels{label_fasti_sh_preview="true"}
+            * on(namespace)
+            (time() - kube_namespace_created > 259200)  # 72 hours
+          for: 1h
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "Preview environment {{ $labels.namespace }} is stale"
+            description: "Preview environment older than 72 hours. PR may have been merged/closed."
+
+    - name: idle.recording
+      interval: 5m
+      rules:
+        # Count of idle resources by type
+        - record: idle:resources:count_by_type
+          expr: |
+            count by (resource_type) (
+              label_replace(
+                (
+                  kube_persistentvolumeclaim_info
+                  unless on(namespace, persistentvolumeclaim)
+                  kube_pod_spec_volumes_persistentvolumeclaims_info
+                ),
+                "resource_type", "pvc", "", ""
+              )
+            )
+
+        # Total unused PVC storage
+        - record: idle:pvc:total_unused_bytes
+          expr: |
+            sum(
+              kube_persistentvolumeclaim_resource_requests_storage_bytes
+              unless on(namespace, persistentvolumeclaim)
+              kube_pod_spec_volumes_persistentvolumeclaims_info
+            )

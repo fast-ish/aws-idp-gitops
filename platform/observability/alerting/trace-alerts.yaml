@@ -1,0 +1,138 @@
+# =============================================================================
+# TRACE-DEPLOYMENT CORRELATION ALERTS
+# =============================================================================
+# Detects issues introduced by deployments using trace data.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: trace-correlation-alerts
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: trace-correlation
+    app.kubernetes.io/component: alerting
+    app.kubernetes.io/part-of: observability
+    prometheus: main
+spec:
+  groups:
+    - name: trace.deployment.correlation
+      interval: 30s
+      rules:
+        # Recording rules for trace-based metrics
+        - record: traces:service:error_rate_by_version
+          expr: |
+            sum by (service, namespace, version) (
+              rate(traces_spanmetrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m])
+            )
+            /
+            sum by (service, namespace, version) (
+              rate(traces_spanmetrics_calls_total[5m])
+            )
+
+        - record: traces:service:latency_p99_by_version
+          expr: |
+            histogram_quantile(0.99,
+              sum by (service, namespace, version, le) (
+                rate(traces_spanmetrics_latency_bucket[5m])
+              )
+            )
+
+        # Alert when new deployment introduces errors
+        - alert: DeploymentIntroducedErrors
+          expr: |
+            (
+              traces:service:error_rate_by_version > 0.1
+            )
+            unless
+            (
+              traces:service:error_rate_by_version offset 30m > 0.05
+            )
+          for: 5m
+          labels:
+            severity: critical
+            category: deployment
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Deployment {{ $labels.version }} introduced errors in {{ $labels.service }}"
+            description: >-
+              Error rate jumped to {{ $value | humanizePercentage }} after deployment
+              of version {{ $labels.version }}. Previous error rate was below 5%.
+            action: "Consider rollback: kubectl argo rollouts undo {{ $labels.service }} -n {{ $labels.namespace }}"
+            dashboard_url: "https://grafana.internal/d/deployment-traces?var-service={{ $labels.service }}&var-version={{ $labels.version }}"
+
+        # Latency regression after deployment
+        - alert: DeploymentLatencyRegression
+          expr: |
+            (
+              traces:service:latency_p99_by_version
+            )
+            > 1.5 * (
+              traces:service:latency_p99_by_version offset 1h
+            )
+          for: 10m
+          labels:
+            severity: warning
+            category: deployment
+          annotations:
+            summary: "Latency regression detected after deployment"
+            description: >-
+              P99 latency increased by 50%+ for {{ $labels.service }} version {{ $labels.version }}.
+              Current: {{ $value | humanizeDuration }}.
+            action: "Investigate performance impact of recent deployment"
+
+        # Downstream service impact (blast radius)
+        - alert: DeploymentBlastRadiusHigh
+          expr: |
+            count by (namespace, upstream_service) (
+              traces:service:error_rate_by_version > 0.05
+            ) > 3
+          for: 10m
+          labels:
+            severity: critical
+            category: deployment
+          annotations:
+            summary: "High blast radius - {{ $labels.upstream_service }} affecting multiple services"
+            description: >-
+              More than 3 downstream services are experiencing elevated errors
+              after changes to {{ $labels.upstream_service }}.
+            action: "Assess blast radius and consider rollback"
+
+        # Trace span errors increased
+        - alert: TraceSpanErrorsIncreased
+          expr: |
+            sum by (service, namespace, span_name) (
+              rate(traces_spanmetrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m])
+            )
+            /
+            sum by (service, namespace, span_name) (
+              rate(traces_spanmetrics_calls_total[5m])
+            ) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+            category: tracing
+          annotations:
+            summary: "Span {{ $labels.span_name }} in {{ $labels.service }} has high error rate"
+            description: >-
+              Span error rate is {{ $value | humanizePercentage }}.
+              This may indicate a specific operation is failing.
+            action: "Check trace details for {{ $labels.span_name }}"
+
+    - name: trace.recording
+      interval: 1m
+      rules:
+        # Blast radius calculation
+        - record: deployment:blast_radius:affected_services
+          expr: |
+            count by (namespace, upstream_service) (
+              traces:service:error_rate_by_version > 0.01
+            )
+
+        # Service dependency count
+        - record: service:dependencies:count
+          expr: |
+            count by (service, namespace) (
+              sum by (service, namespace, client_service) (
+                rate(traces_service_graph_request_total[5m])
+              ) > 0
+            )

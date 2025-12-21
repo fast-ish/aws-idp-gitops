@@ -1,0 +1,144 @@
+# =============================================================================
+# DEPLOYMENT WINDOWS POLICY
+# =============================================================================
+# Enforces deployment freezes during configured windows.
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enforce-deployment-windows
+  annotations:
+    policies.kyverno.io/title: Enforce Deployment Windows
+    policies.kyverno.io/category: Compliance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Deployment, Rollout
+    policies.kyverno.io/description: >-
+      Blocks deployments during configured freeze windows.
+      Use annotation fasti.sh/bypass-freeze=true for emergency deployments.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    # Block all deployments during global freeze
+    - name: block-during-global-freeze
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - apps/v1/Deployment
+              namespaces:
+                - "prod-*"
+                - "production"
+      exclude:
+        any:
+          - resources:
+              annotations:
+                fasti.sh/bypass-freeze: "true"
+      context:
+        - name: deploymentWindow
+          configMap:
+            name: deployment-windows
+            namespace: governance
+      preconditions:
+        all:
+          - key: "{{ deploymentWindow.data.status || 'open' }}"
+            operator: Equals
+            value: "frozen"
+      validate:
+        message: >-
+          Deployments are currently frozen.
+          Reason: {{ deploymentWindow.data.freeze_reason || 'Scheduled freeze window' }}.
+          To bypass for emergency, add annotation: fasti.sh/bypass-freeze=true
+        deny: {}
+
+    # Block Argo Rollouts during freeze
+    - name: block-rollouts-during-freeze
+      match:
+        any:
+          - resources:
+              kinds:
+                - Rollout
+                - argoproj.io/v1alpha1/Rollout
+              namespaces:
+                - "prod-*"
+                - "production"
+      exclude:
+        any:
+          - resources:
+              annotations:
+                fasti.sh/bypass-freeze: "true"
+      context:
+        - name: deploymentWindow
+          configMap:
+            name: deployment-windows
+            namespace: governance
+      preconditions:
+        all:
+          - key: "{{ deploymentWindow.data.status || 'open' }}"
+            operator: Equals
+            value: "frozen"
+      validate:
+        message: >-
+          Rollouts are currently frozen.
+          Reason: {{ deploymentWindow.data.freeze_reason || 'Scheduled freeze window' }}.
+        deny: {}
+
+    # Audit bypass usage
+    - name: audit-freeze-bypass
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - Rollout
+              annotations:
+                fasti.sh/bypass-freeze: "true"
+      validate:
+        message: "Emergency deployment bypass detected - audit logged"
+        pattern:
+          metadata:
+            annotations:
+              fasti.sh/bypass-freeze: "true"
+              fasti.sh/bypass-reason: "?*"  # Require reason for bypass
+---
+# =============================================================================
+# TEAM-SPECIFIC DEPLOYMENT WINDOWS
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: team-deployment-windows
+  annotations:
+    policies.kyverno.io/title: Team Deployment Windows
+    policies.kyverno.io/category: Compliance
+    policies.kyverno.io/description: >-
+      Allows teams to define their own deployment windows via namespace ConfigMap.
+spec:
+  validationFailureAction: Audit  # Audit mode - teams opt-in
+  background: false
+  rules:
+    - name: check-team-deployment-window
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - Rollout
+              namespaces:
+                - "team-*"
+      context:
+        - name: teamConfig
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{request.namespace}}/configmaps/deployment-config"
+            jmesPath: "data"
+      preconditions:
+        all:
+          - key: "{{ teamConfig.deployment_allowed || 'true' }}"
+            operator: Equals
+            value: "false"
+      validate:
+        message: >-
+          Deployment not allowed for team {{ request.namespace }} at this time.
+          Check team deployment schedule in ConfigMap deployment-config.
+        deny: {}

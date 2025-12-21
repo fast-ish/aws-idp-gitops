@@ -1,0 +1,71 @@
+team: integrations
+namespace: team-integrations
+description: "Integrations team - third-party APIs, webhooks, and external system connectors"
+
+owner:
+  name: "Integrations Team"
+  email: integrations@example.com
+  slack: "#integrations-eng"
+
+resourceQuota:
+  requests:
+    cpu: "12"
+    memory: "24Gi"
+  limits:
+    cpu: "24"
+    memory: "48Gi"
+  pods: "40"
+  services: "15"
+  configmaps: "25"
+  secrets: "30"
+  persistentvolumeclaims: "5"
+
+limitRange:
+  default:
+    cpu: "300m"
+    memory: "256Mi"
+  defaultRequest:
+    cpu: "50m"
+    memory: "64Mi"
+  max:
+    cpu: "2"
+    memory: "4Gi"
+
+networkPolicy:
+  allowIngress: true
+  allowEgress: true
+  allowFromNamespaces:
+    - team-backend
+    - argocd
+    - monitoring
+
+apps:
+  - name: webhook-gateway
+    repoURL: https://github.com/fast-ish/webhook-gateway
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: slack-integration
+    repoURL: https://github.com/fast-ish/slack-integration
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: payment-gateway
+    repoURL: https://github.com/fast-ish/payment-gateway
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: crm-sync
+    repoURL: https://github.com/fast-ish/crm-sync
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: email-service
+    repoURL: https://github.com/fast-ish/email-service
+    manifestPath: k8s
+    targetRevision: main
+    environment: production

@@ -1,0 +1,130 @@
+# =============================================================================
+# RIGHTSIZING ALERTS
+# =============================================================================
+# Alerts for resource optimization opportunities based on VPA recommendations.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rightsizing-alerts
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: rightsizing-alerts
+    app.kubernetes.io/component: alerting
+    app.kubernetes.io/part-of: resource-optimization
+    prometheus: main
+spec:
+  groups:
+    - name: rightsizing.alerts
+      interval: 5m
+      rules:
+        # Recording rules for VPA recommendations
+        - record: vpa:container:memory_recommendation_ratio
+          expr: |
+            (
+              sum by (namespace, container, target_name) (
+                vpa_recommender_recommendation{recommendation="target", resource="memory"}
+              )
+              /
+              sum by (namespace, container, target_name) (
+                kube_pod_container_resource_requests{resource="memory"}
+              )
+            )
+
+        - record: vpa:container:cpu_recommendation_ratio
+          expr: |
+            (
+              sum by (namespace, container, target_name) (
+                vpa_recommender_recommendation{recommendation="target", resource="cpu"}
+              )
+              /
+              sum by (namespace, container, target_name) (
+                kube_pod_container_resource_requests{resource="cpu"}
+              )
+            )
+
+        # Memory over-provisioned (using less than 50% of request)
+        - alert: ResourceOverProvisioned
+          expr: |
+            vpa:container:memory_recommendation_ratio < 0.5
+            and
+            sum by (namespace, container, target_name) (
+              kube_pod_container_resource_requests{resource="memory"}
+            ) > 268435456  # > 256Mi to avoid noise
+          for: 7d
+          labels:
+            severity: info
+            category: cost
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Container {{ $labels.container }} in {{ $labels.namespace }} is over-provisioned"
+            description: >-
+              VPA recommends {{ $value | humanizePercentage }} of current memory request.
+              Current: {{ with query "sum by (namespace, container) (kube_pod_container_resource_requests{resource=\"memory\", namespace=\"" }}{{ . | first | value | humanize1024 }}{{ end }}
+            action: "Consider reducing memory requests to save costs"
+            dashboard_url: "https://goldilocks.internal/dashboard/{{ $labels.namespace }}"
+
+        # Memory under-provisioned (needs 50%+ more)
+        - alert: ResourceUnderProvisioned
+          expr: |
+            vpa:container:memory_recommendation_ratio > 1.5
+          for: 24h
+          labels:
+            severity: warning
+            category: reliability
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Container {{ $labels.container }} in {{ $labels.namespace }} is under-provisioned"
+            description: >-
+              VPA recommends {{ $value | humanizePercentage }} of current memory request.
+              Container may be experiencing OOM pressure.
+            action: "Consider increasing memory requests"
+            dashboard_url: "https://goldilocks.internal/dashboard/{{ $labels.namespace }}"
+
+        # CPU over-provisioned
+        - alert: CPUOverProvisioned
+          expr: |
+            vpa:container:cpu_recommendation_ratio < 0.3
+            and
+            sum by (namespace, container, target_name) (
+              kube_pod_container_resource_requests{resource="cpu"}
+            ) > 0.1  # > 100m to avoid noise
+          for: 7d
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "Container {{ $labels.container }} in {{ $labels.namespace }} CPU over-provisioned"
+            description: "VPA recommends only {{ $value | humanizePercentage }} of current CPU request."
+
+        # No VPA recommendation available
+        - alert: VPARecommendationMissing
+          expr: |
+            count by (namespace) (kube_deployment_spec_replicas) > 0
+            unless
+            count by (namespace) (vpa_recommender_recommendation)
+          for: 7d
+          labels:
+            severity: info
+            category: observability
+          annotations:
+            summary: "No VPA recommendations for namespace {{ $labels.namespace }}"
+            description: "VPA is not providing recommendations. Check if Goldilocks label is set."
+
+    - name: rightsizing.recording
+      interval: 5m
+      rules:
+        # Potential monthly savings (rough estimate)
+        - record: rightsizing:potential_savings_ratio
+          expr: |
+            1 - avg(vpa:container:memory_recommendation_ratio < 1)
+
+        # Count of over-provisioned containers
+        - record: rightsizing:overprovisioned_containers_count
+          expr: |
+            count(vpa:container:memory_recommendation_ratio < 0.5)
+
+        # Count of under-provisioned containers
+        - record: rightsizing:underprovisioned_containers_count
+          expr: |
+            count(vpa:container:memory_recommendation_ratio > 1.5)

@@ -1,0 +1,243 @@
+# =============================================================================
+# CI DISPATCHER WORKFLOW
+# =============================================================================
+# Smart dispatcher that reads .argo/ci.yaml from the repository and delegates
+# to the appropriate language-specific workflow template.
+#
+# This allows repos to self-declare their build configuration:
+#   .argo/ci.yaml:
+#     language: java
+#     team: backend
+#     config:
+#       java-version: "21"
+#       maven-goals: "clean verify"
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ci-dispatcher
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: ci-dispatcher
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+  annotations:
+    description: |
+      Dispatcher workflow that reads .argo/ci.yaml and delegates to
+      the appropriate language-specific CI workflow.
+spec:
+  entrypoint: dispatch
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+
+  arguments:
+    parameters:
+      - name: repo-url
+        description: Git repository URL
+      - name: revision
+        default: main
+        description: Git revision
+      - name: app-name
+        description: Application name
+
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+
+  templates:
+    - name: dispatch
+      steps:
+        - - name: clone-and-detect
+            template: detect-language
+
+        - - name: trigger-java
+            template: trigger-workflow
+            when: "{{steps.clone-and-detect.outputs.parameters.language}} == java"
+            arguments:
+              parameters:
+                - name: workflow-template
+                  value: ci-java
+                - name: language
+                  value: java
+                - name: team
+                  value: "{{steps.clone-and-detect.outputs.parameters.team}}"
+                - name: config
+                  value: "{{steps.clone-and-detect.outputs.parameters.config}}"
+
+          - name: trigger-python
+            template: trigger-workflow
+            when: "{{steps.clone-and-detect.outputs.parameters.language}} == python"
+            arguments:
+              parameters:
+                - name: workflow-template
+                  value: ci-python
+                - name: language
+                  value: python
+                - name: team
+                  value: "{{steps.clone-and-detect.outputs.parameters.team}}"
+                - name: config
+                  value: "{{steps.clone-and-detect.outputs.parameters.config}}"
+
+          - name: trigger-node
+            template: trigger-workflow
+            when: "{{steps.clone-and-detect.outputs.parameters.language}} == node"
+            arguments:
+              parameters:
+                - name: workflow-template
+                  value: ci-node
+                - name: language
+                  value: node
+                - name: team
+                  value: "{{steps.clone-and-detect.outputs.parameters.team}}"
+                - name: config
+                  value: "{{steps.clone-and-detect.outputs.parameters.config}}"
+
+          - name: trigger-go
+            template: trigger-workflow
+            when: "{{steps.clone-and-detect.outputs.parameters.language}} == go"
+            arguments:
+              parameters:
+                - name: workflow-template
+                  value: ci-go
+                - name: language
+                  value: go
+                - name: team
+                  value: "{{steps.clone-and-detect.outputs.parameters.team}}"
+                - name: config
+                  value: "{{steps.clone-and-detect.outputs.parameters.config}}"
+
+          - name: trigger-ruby
+            template: trigger-workflow
+            when: "{{steps.clone-and-detect.outputs.parameters.language}} == ruby"
+            arguments:
+              parameters:
+                - name: workflow-template
+                  value: ci-ruby
+                - name: language
+                  value: ruby
+                - name: team
+                  value: "{{steps.clone-and-detect.outputs.parameters.team}}"
+                - name: config
+                  value: "{{steps.clone-and-detect.outputs.parameters.config}}"
+
+    - name: detect-language
+      outputs:
+        parameters:
+          - name: language
+            valueFrom:
+              path: /tmp/language
+          - name: team
+            valueFrom:
+              path: /tmp/team
+          - name: config
+            valueFrom:
+              path: /tmp/config
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            apk add --no-cache yq jq
+
+            echo "Cloning {{workflow.parameters.repo-url}} at {{workflow.parameters.revision}}"
+            git clone --depth 1 {{workflow.parameters.repo-url}} /work/src || \
+              (git clone {{workflow.parameters.repo-url}} /work/src && \
+               cd /work/src && git checkout {{workflow.parameters.revision}})
+
+            cd /work/src
+
+            # Default values
+            LANGUAGE="unknown"
+            TEAM="platform"
+            CONFIG="{}"
+
+            # Try to read .argo/ci.yaml
+            if [ -f ".argo/ci.yaml" ]; then
+              echo "Found .argo/ci.yaml"
+              LANGUAGE=$(yq -r '.language // "unknown"' .argo/ci.yaml)
+              TEAM=$(yq -r '.team // "platform"' .argo/ci.yaml)
+              CONFIG=$(yq -c '.config // {}' .argo/ci.yaml)
+            else
+              # Auto-detect language from files
+              echo "No .argo/ci.yaml found, auto-detecting..."
+
+              if [ -f "pom.xml" ] || [ -f "build.gradle" ]; then
+                LANGUAGE="java"
+              elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ] || [ -f "setup.py" ]; then
+                LANGUAGE="python"
+              elif [ -f "package.json" ]; then
+                LANGUAGE="node"
+              elif [ -f "go.mod" ]; then
+                LANGUAGE="go"
+              elif [ -f "Gemfile" ]; then
+                LANGUAGE="ruby"
+              fi
+
+              # Try to detect team from catalog-info.yaml
+              if [ -f "catalog-info.yaml" ]; then
+                DETECTED_TEAM=$(yq -r '.spec.owner // "platform"' catalog-info.yaml | sed 's/group://' | sed 's/team-//')
+                if [ "$DETECTED_TEAM" != "null" ] && [ -n "$DETECTED_TEAM" ]; then
+                  TEAM="$DETECTED_TEAM"
+                fi
+              fi
+            fi
+
+            echo "Detected language: $LANGUAGE"
+            echo "Team: $TEAM"
+            echo "Config: $CONFIG"
+
+            echo -n "$LANGUAGE" > /tmp/language
+            echo -n "$TEAM" > /tmp/team
+            echo -n "$CONFIG" > /tmp/config
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: trigger-workflow
+      inputs:
+        parameters:
+          - name: workflow-template
+          - name: language
+          - name: team
+          - name: config
+      resource:
+        action: create
+        manifest: |
+          apiVersion: argoproj.io/v1alpha1
+          kind: Workflow
+          metadata:
+            generateName: ci-{{inputs.parameters.language}}-
+            namespace: argo
+            labels:
+              fasti.sh/language: "{{inputs.parameters.language}}"
+              fasti.sh/team: "{{inputs.parameters.team}}"
+              fasti.sh/dispatched: "true"
+          spec:
+            workflowTemplateRef:
+              name: "{{inputs.parameters.workflow-template}}"
+            arguments:
+              parameters:
+                - name: repo-url
+                  value: "{{workflow.parameters.repo-url}}"
+                - name: revision
+                  value: "{{workflow.parameters.revision}}"
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+                - name: team
+                  value: "{{inputs.parameters.team}}"

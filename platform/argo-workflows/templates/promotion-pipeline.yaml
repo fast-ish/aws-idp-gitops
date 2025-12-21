@@ -1,0 +1,537 @@
+# =============================================================================
+# MULTI-ENVIRONMENT PROMOTION PIPELINE
+# =============================================================================
+# Promotes applications through dev → staging → prod with approval gates.
+#
+# Trigger: Manual or automated after successful smoke tests
+# Flow: dev (auto) → staging (auto with smoke) → prod (approval required)
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: promotion-pipeline
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: promotion-pipeline
+    app.kubernetes.io/component: workflow-template
+spec:
+  entrypoint: promote
+  serviceAccountName: argo-workflow
+  arguments:
+    parameters:
+      - name: app
+        description: "Application name"
+      - name: team
+        description: "Team name"
+      - name: image-tag
+        description: "Docker image tag to promote"
+      - name: source-env
+        description: "Source environment (dev, staging)"
+        default: "dev"
+      - name: target-env
+        description: "Target environment (staging, prod)"
+        default: "staging"
+      - name: skip-smoke-tests
+        description: "Skip smoke tests (not recommended)"
+        default: "false"
+      - name: auto-approve
+        description: "Auto-approve promotion (only for non-prod)"
+        default: "false"
+
+  templates:
+    # =========================================================================
+    # MAIN PROMOTION WORKFLOW
+    # =========================================================================
+    - name: promote
+      dag:
+        tasks:
+          # Validate promotion request
+          - name: validate
+            template: validate-promotion
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: source-env
+                  value: "{{workflow.parameters.source-env}}"
+                - name: target-env
+                  value: "{{workflow.parameters.target-env}}"
+
+          # Get current deployment info
+          - name: get-current-state
+            template: get-deployment-state
+            dependencies: [validate]
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: team
+                  value: "{{workflow.parameters.team}}"
+                - name: env
+                  value: "{{workflow.parameters.source-env}}"
+
+          # Run smoke tests on source environment
+          - name: smoke-tests
+            template: run-smoke-tests
+            dependencies: [get-current-state]
+            when: "{{workflow.parameters.skip-smoke-tests}} != true"
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: env
+                  value: "{{workflow.parameters.source-env}}"
+                - name: endpoint
+                  value: "{{tasks.get-current-state.outputs.parameters.endpoint}}"
+
+          # Request approval for prod promotions
+          - name: request-approval
+            template: approval-gate
+            dependencies: [smoke-tests]
+            when: "{{workflow.parameters.target-env}} == prod && {{workflow.parameters.auto-approve}} != true"
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: target-env
+                  value: "{{workflow.parameters.target-env}}"
+                - name: image-tag
+                  value: "{{workflow.parameters.image-tag}}"
+
+          # Update GitOps repository
+          - name: update-gitops
+            template: update-gitops-repo
+            dependencies: [request-approval]
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: team
+                  value: "{{workflow.parameters.team}}"
+                - name: target-env
+                  value: "{{workflow.parameters.target-env}}"
+                - name: image-tag
+                  value: "{{workflow.parameters.image-tag}}"
+
+          # Wait for ArgoCD sync
+          - name: wait-for-sync
+            template: wait-argocd-sync
+            dependencies: [update-gitops]
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: target-env
+                  value: "{{workflow.parameters.target-env}}"
+
+          # Verify deployment
+          - name: verify-deployment
+            template: verify-rollout
+            dependencies: [wait-for-sync]
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: team
+                  value: "{{workflow.parameters.team}}"
+                - name: target-env
+                  value: "{{workflow.parameters.target-env}}"
+
+          # Send notification
+          - name: notify
+            template: send-notification
+            dependencies: [verify-deployment]
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: target-env
+                  value: "{{workflow.parameters.target-env}}"
+                - name: image-tag
+                  value: "{{workflow.parameters.image-tag}}"
+                - name: status
+                  value: "{{tasks.verify-deployment.outputs.parameters.status}}"
+
+    # =========================================================================
+    # VALIDATION
+    # =========================================================================
+    - name: validate-promotion
+      inputs:
+        parameters:
+          - name: app
+          - name: source-env
+          - name: target-env
+      script:
+        image: alpine:3.19
+        command: [sh]
+        source: |
+          #!/bin/sh
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          SOURCE="{{inputs.parameters.source-env}}"
+          TARGET="{{inputs.parameters.target-env}}"
+
+          echo "Validating promotion: $APP from $SOURCE to $TARGET"
+
+          # Validate promotion path
+          case "$SOURCE-$TARGET" in
+            dev-staging|staging-prod)
+              echo "✓ Valid promotion path: $SOURCE → $TARGET"
+              ;;
+            dev-prod)
+              echo "✗ Cannot skip staging - must promote dev → staging → prod"
+              exit 1
+              ;;
+            *)
+              echo "✗ Invalid promotion path: $SOURCE → $TARGET"
+              exit 1
+              ;;
+          esac
+
+          echo "Validation passed"
+
+    # =========================================================================
+    # GET DEPLOYMENT STATE
+    # =========================================================================
+    - name: get-deployment-state
+      inputs:
+        parameters:
+          - name: app
+          - name: team
+          - name: env
+      outputs:
+        parameters:
+          - name: endpoint
+            valueFrom:
+              path: /tmp/endpoint
+          - name: current-image
+            valueFrom:
+              path: /tmp/current-image
+      script:
+        image: bitnami/kubectl:1.29
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          TEAM="{{inputs.parameters.team}}"
+          ENV="{{inputs.parameters.env}}"
+          NAMESPACE="${TEAM}-${ENV}"
+
+          echo "Getting deployment state for $APP in $NAMESPACE"
+
+          # Get current image
+          CURRENT_IMAGE=$(kubectl get rollout "$APP" -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+          echo "$CURRENT_IMAGE" > /tmp/current-image
+
+          # Get service endpoint
+          if [ "$ENV" = "prod" ]; then
+            ENDPOINT="https://${APP}.fasti.sh"
+          else
+            ENDPOINT="https://${APP}.${ENV}.fasti.sh"
+          fi
+          echo "$ENDPOINT" > /tmp/endpoint
+
+          echo "Current image: $CURRENT_IMAGE"
+          echo "Endpoint: $ENDPOINT"
+
+    # =========================================================================
+    # SMOKE TESTS
+    # =========================================================================
+    - name: run-smoke-tests
+      inputs:
+        parameters:
+          - name: app
+          - name: env
+          - name: endpoint
+      script:
+        image: curlimages/curl:8.5.0
+        command: [sh]
+        source: |
+          #!/bin/sh
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          ENV="{{inputs.parameters.env}}"
+          ENDPOINT="{{inputs.parameters.endpoint}}"
+
+          echo "Running smoke tests for $APP in $ENV"
+          echo "Endpoint: $ENDPOINT"
+
+          # Health check
+          echo "→ Health check..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 5 \
+            "${ENDPOINT}/health" || echo "000")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "  ✓ Health check passed (HTTP $HTTP_CODE)"
+          else
+            echo "  ✗ Health check failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          # Readiness check
+          echo "→ Readiness check..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 30 \
+            "${ENDPOINT}/ready" || echo "000")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "  ✓ Readiness check passed (HTTP $HTTP_CODE)"
+          else
+            echo "  ✗ Readiness check failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          echo "All smoke tests passed!"
+
+    # =========================================================================
+    # APPROVAL GATE
+    # =========================================================================
+    - name: approval-gate
+      inputs:
+        parameters:
+          - name: app
+          - name: target-env
+          - name: image-tag
+      suspend: {}
+      # This template suspends the workflow until manually resumed
+      # Resume with: argo resume <workflow-name>
+      # Or via ArgoCD UI / Slack integration
+
+    # =========================================================================
+    # UPDATE GITOPS REPOSITORY
+    # =========================================================================
+    - name: update-gitops-repo
+      inputs:
+        parameters:
+          - name: app
+          - name: team
+          - name: target-env
+          - name: image-tag
+      script:
+        image: alpine/git:2.43.0
+        env:
+          - name: GITHUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: github-token
+                key: token
+        command: [sh]
+        source: |
+          #!/bin/sh
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          TEAM="{{inputs.parameters.team}}"
+          ENV="{{inputs.parameters.target-env}}"
+          TAG="{{inputs.parameters.image-tag}}"
+
+          echo "Updating GitOps repo for $APP → $ENV with tag $TAG"
+
+          # Clone gitops repo
+          git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/fast-ish/aws-idp-gitops.git" /tmp/gitops
+          cd /tmp/gitops
+
+          # Configure git
+          git config user.email "argo-workflows@fasti.sh"
+          git config user.name "Argo Workflows"
+
+          # Update kustomization
+          OVERLAY_PATH="teams/${TEAM}/apps/${APP}/overlays/${ENV}"
+
+          if [ ! -d "$OVERLAY_PATH" ]; then
+            echo "Creating overlay for $ENV"
+            mkdir -p "$OVERLAY_PATH"
+            cat > "$OVERLAY_PATH/kustomization.yaml" << EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          namespace: ${TEAM}-${ENV}
+          resources:
+            - ../../base
+          images:
+            - name: IMAGE_PLACEHOLDER
+              newName: 351619759866.dkr.ecr.us-west-2.amazonaws.com/${TEAM}/${APP}
+              newTag: "${TAG}"
+          EOF
+          else
+            # Update existing overlay
+            cd "$OVERLAY_PATH"
+            if command -v kustomize > /dev/null; then
+              kustomize edit set image "IMAGE_PLACEHOLDER=351619759866.dkr.ecr.us-west-2.amazonaws.com/${TEAM}/${APP}:${TAG}"
+            else
+              # Fallback: sed replacement
+              sed -i "s|newTag:.*|newTag: \"${TAG}\"|g" kustomization.yaml
+            fi
+            cd /tmp/gitops
+          fi
+
+          # Commit and push
+          git add -A
+          git commit -m "promote(${APP}): deploy ${TAG} to ${ENV}
+
+          Automated promotion by Argo Workflows.
+
+          App: ${APP}
+          Team: ${TEAM}
+          Environment: ${ENV}
+          Image Tag: ${TAG}"
+
+          git push origin main
+
+          echo "GitOps repository updated successfully"
+
+    # =========================================================================
+    # WAIT FOR ARGOCD SYNC
+    # =========================================================================
+    - name: wait-argocd-sync
+      inputs:
+        parameters:
+          - name: app
+          - name: target-env
+      script:
+        image: argoproj/argocd:v2.10.0
+        env:
+          - name: ARGOCD_AUTH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: argocd-token
+                key: token
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          ENV="{{inputs.parameters.target-env}}"
+          ARGOCD_APP="${APP}-${ENV}"
+
+          echo "Waiting for ArgoCD to sync $ARGOCD_APP"
+
+          # Trigger sync
+          argocd app sync "$ARGOCD_APP" \
+            --server argocd-server.argocd.svc.cluster.local \
+            --grpc-web \
+            --async
+
+          # Wait for sync to complete
+          argocd app wait "$ARGOCD_APP" \
+            --server argocd-server.argocd.svc.cluster.local \
+            --grpc-web \
+            --timeout 600 \
+            --sync \
+            --health
+
+          echo "ArgoCD sync completed successfully"
+
+    # =========================================================================
+    # VERIFY ROLLOUT
+    # =========================================================================
+    - name: verify-rollout
+      inputs:
+        parameters:
+          - name: app
+          - name: team
+          - name: target-env
+      outputs:
+        parameters:
+          - name: status
+            valueFrom:
+              path: /tmp/status
+      script:
+        image: argoproj/argo-rollouts:v1.6.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          TEAM="{{inputs.parameters.team}}"
+          ENV="{{inputs.parameters.target-env}}"
+          NAMESPACE="${TEAM}-${ENV}"
+
+          echo "Verifying rollout for $APP in $NAMESPACE"
+
+          # Wait for rollout to complete
+          kubectl-argo-rollouts status "$APP" -n "$NAMESPACE" \
+            --timeout 600s \
+            --watch
+
+          # Get final status
+          STATUS=$(kubectl-argo-rollouts status "$APP" -n "$NAMESPACE" \
+            --timeout 10s 2>/dev/null | head -1 || echo "Unknown")
+
+          echo "$STATUS" > /tmp/status
+
+          if echo "$STATUS" | grep -q "Healthy"; then
+            echo "✓ Rollout completed successfully"
+          else
+            echo "✗ Rollout status: $STATUS"
+            exit 1
+          fi
+
+    # =========================================================================
+    # SEND NOTIFICATION
+    # =========================================================================
+    - name: send-notification
+      inputs:
+        parameters:
+          - name: app
+          - name: target-env
+          - name: image-tag
+          - name: status
+      script:
+        image: curlimages/curl:8.5.0
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook
+                key: url
+                optional: true
+        command: [sh]
+        source: |
+          #!/bin/sh
+
+          APP="{{inputs.parameters.app}}"
+          ENV="{{inputs.parameters.target-env}}"
+          TAG="{{inputs.parameters.image-tag}}"
+          STATUS="{{inputs.parameters.status}}"
+
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "Slack webhook not configured, skipping notification"
+            exit 0
+          fi
+
+          if echo "$STATUS" | grep -qi "healthy\|success"; then
+            EMOJI="✅"
+            COLOR="good"
+          else
+            EMOJI="❌"
+            COLOR="danger"
+          fi
+
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"${COLOR}\",
+                \"blocks\": [
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"${EMOJI} *Promotion Complete*\n*App:* ${APP}\n*Environment:* ${ENV}\n*Tag:* \`${TAG}\`\n*Status:* ${STATUS}\"
+                    }
+                  }
+                ]
+              }]
+            }"
+
+          echo "Notification sent"

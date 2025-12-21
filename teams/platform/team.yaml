@@ -1,0 +1,53 @@
+team: platform
+namespace: team-platform
+description: "Platform engineering - internal tools and developer experience"
+
+owner:
+  name: "Platform Team"
+  email: platform@example.com
+  slack: "#platform-eng"
+
+# Resource quotas for the namespace
+resourceQuota:
+  requests:
+    cpu: "10"
+    memory: "20Gi"
+  limits:
+    cpu: "20"
+    memory: "40Gi"
+  pods: "30"
+  services: "10"
+  configmaps: "20"
+  secrets: "20"
+  persistentvolumeclaims: "5"
+
+# Default limits for containers without explicit limits
+limitRange:
+  default:
+    cpu: "500m"
+    memory: "512Mi"
+  defaultRequest:
+    cpu: "100m"
+    memory: "128Mi"
+  max:
+    cpu: "2"
+    memory: "4Gi"
+
+# Network policies
+networkPolicy:
+  # Allow ingress from ingress controller
+  allowIngress: true
+  # Allow egress to internet
+  allowEgress: true
+  # Allow traffic from these namespaces
+  allowFromNamespaces:
+    - argocd
+    - monitoring
+
+# Applications deployed for this team
+apps:
+  - name: internal-api
+    repoURL: https://github.com/fast-ish/internal-api
+    manifestPath: k8s
+    targetRevision: main
+    environment: production

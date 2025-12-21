@@ -1,0 +1,45 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-default-resource-quota
+  annotations:
+    policies.kyverno.io/title: Generate Default Resource Quota
+    policies.kyverno.io/category: Resource Management
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Namespace
+    policies.kyverno.io/description: >-
+      Automatically generates a default ResourceQuota for team namespaces
+      that don't already have one defined via team-resources Helm chart.
+spec:
+  rules:
+    - name: generate-default-quota
+      match:
+        any:
+          - resources:
+              kinds:
+                - Namespace
+              names:
+                - "team-*"
+      preconditions:
+        all:
+          - key: "{{request.object.metadata.labels.\"team-resources/managed\"}}"
+            operator: NotEquals
+            value: "true"
+      generate:
+        synchronize: true
+        apiVersion: v1
+        kind: ResourceQuota
+        name: default-quota
+        namespace: "{{request.object.metadata.name}}"
+        data:
+          spec:
+            hard:
+              requests.cpu: "4"
+              requests.memory: 8Gi
+              limits.cpu: "8"
+              limits.memory: 16Gi
+              pods: "20"
+              services: "10"
+              configmaps: "20"
+              secrets: "20"
+              persistentvolumeclaims: "5"

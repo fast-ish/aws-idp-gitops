@@ -1,0 +1,226 @@
+# =============================================================================
+# MULTI-ENVIRONMENT APPLICATION DEPLOYMENT
+# =============================================================================
+# Deploys applications across dev, staging, and prod environments.
+# Each environment has its own namespace and configuration overlay.
+#
+# Directory Structure Expected:
+#   teams/<team>/apps/<app>/
+#     ├── base/                    # Base Kubernetes manifests
+#     │   ├── kustomization.yaml
+#     │   ├── rollout.yaml
+#     │   └── service.yaml
+#     └── overlays/
+#         ├── dev/
+#         │   └── kustomization.yaml
+#         ├── staging/
+#         │   └── kustomization.yaml
+#         └── prod/
+#             └── kustomization.yaml
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: multi-env-apps
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: multi-env-apps
+    app.kubernetes.io/component: applicationset
+    app.kubernetes.io/part-of: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - matrix:
+        generators:
+          # Discover all apps with environment overlays
+          - git:
+              repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+              revision: HEAD
+              directories:
+                - path: "teams/*/apps/*/overlays/*"
+          # Extract metadata
+          - list:
+              elements: []
+              elementsYaml: |
+                - dummy: value
+  template:
+    metadata:
+      name: "{{.path.basename}}-{{index .path.segments 1}}-{{index .path.segments 3}}"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/name: "{{index .path.segments 3}}"
+        app.kubernetes.io/instance: "{{.path.basename}}"
+        app.kubernetes.io/component: application
+        fasti.sh/team: "{{index .path.segments 1}}"
+        fasti.sh/environment: "{{.path.basename}}"
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: deployments
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: deployments
+        notifications.argoproj.io/subscribe.on-health-degraded.slack: deployments
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: "{{index .path.segments 1}}"
+      source:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        targetRevision: HEAD
+        path: "{{.path.path}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{index .path.segments 1}}-{{.path.basename}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+        - group: argoproj.io
+          kind: Rollout
+          jsonPointers:
+            - /spec/replicas
+            - /status
+---
+# =============================================================================
+# ENVIRONMENT-SPECIFIC APPPROJECTS
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: dev
+  namespace: argocd
+spec:
+  description: "Development environment - auto-sync enabled"
+  sourceRepos:
+    - "https://github.com/fast-ish/*"
+  destinations:
+    - namespace: "*-dev"
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  orphanedResources:
+    warn: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: staging
+  namespace: argocd
+spec:
+  description: "Staging environment - auto-sync with smoke tests"
+  sourceRepos:
+    - "https://github.com/fast-ish/*"
+  destinations:
+    - namespace: "*-staging"
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  orphanedResources:
+    warn: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: prod
+  namespace: argocd
+spec:
+  description: "Production environment - requires approval for sync"
+  sourceRepos:
+    - "https://github.com/fast-ish/*"
+  destinations:
+    - namespace: "*-prod"
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  orphanedResources:
+    warn: true
+  # Production apps require explicit sync
+  syncWindows:
+    - kind: deny
+      schedule: "* * * * *"
+      duration: 24h
+      applications:
+        - "*"
+      manualSync: true
+---
+# =============================================================================
+# PROMOTION TRIGGER SENSOR
+# =============================================================================
+# Triggers promotion workflow when PR is merged to main
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: promotion-trigger
+  namespace: argo-events
+spec:
+  template:
+    serviceAccountName: argo-events-sa
+  dependencies:
+    - name: github-push
+      eventSourceName: github
+      eventName: push
+      filters:
+        data:
+          - path: body.ref
+            type: string
+            value:
+              - "refs/heads/main"
+          - path: body.commits.0.message
+            type: string
+            comparator: "contains"
+            value:
+              - "promote("
+  triggers:
+    - template:
+        name: trigger-promotion
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: promotion-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: promotion-pipeline
+                arguments:
+                  parameters:
+                    - name: app
+                      # Extract app name from commit message: "promote(app-name):"
+                      value: ""
+                    - name: team
+                      value: ""
+                    - name: image-tag
+                      value: ""
+                    - name: target-env
+                      value: "staging"
+          parameters:
+            - src:
+                dependencyName: github-push
+                dataKey: body.commits.0.message
+                dataTemplate: "{{ regexReplaceAll \"promote\\\\(([^)]+)\\\\):.*\" .Input \"$1\" }}"
+              dest: spec.arguments.parameters.0.value

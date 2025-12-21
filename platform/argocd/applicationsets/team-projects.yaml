@@ -1,0 +1,51 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: team-projects
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        revision: HEAD
+        files:
+          - path: "teams/*/team.yaml"
+  template:
+    metadata:
+      name: "team-{{.team}}-project"
+      labels:
+        app.kubernetes.io/name: "{{.team}}"
+        app.kubernetes.io/component: project
+        app.kubernetes.io/part-of: idp
+        team: "{{.team}}"
+    spec:
+      project: platform
+      source:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        targetRevision: HEAD
+        path: platform/team-project
+        helm:
+          valuesObject:
+            team:
+              name: "{{.team}}"
+              namespace: "{{.namespace}}"
+              description: "{{.description}}"
+            owner:
+              email: "{{.owner.email}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: argocd
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=false
+        retry:
+          limit: 3
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

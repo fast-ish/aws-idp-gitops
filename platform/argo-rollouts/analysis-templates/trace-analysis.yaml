@@ -1,0 +1,245 @@
+# =============================================================================
+# TRACE-BASED ANALYSIS TEMPLATES
+# =============================================================================
+# Analysis templates for Argo Rollouts using trace metrics.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: trace-error-analysis
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: trace-error-analysis
+    app.kubernetes.io/component: analysis-template
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+    - name: canary-hash
+  metrics:
+    - name: trace-error-rate
+      interval: 30s
+      count: 10
+      successCondition: result[0] < 0.05
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            sum(rate(traces_spanmetrics_calls_total{
+              service="{{args.service-name}}",
+              namespace="{{args.namespace}}",
+              status_code="STATUS_CODE_ERROR"
+            }[5m]))
+            /
+            sum(rate(traces_spanmetrics_calls_total{
+              service="{{args.service-name}}",
+              namespace="{{args.namespace}}"
+            }[5m]))
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: trace-latency-analysis
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: trace-latency-analysis
+    app.kubernetes.io/component: analysis-template
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+    - name: latency-threshold
+      value: "500"  # milliseconds
+  metrics:
+    - name: trace-latency-p99
+      interval: 30s
+      count: 10
+      successCondition: result[0] < {{args.latency-threshold}}
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(traces_spanmetrics_latency_bucket{
+                  service="{{args.service-name}}",
+                  namespace="{{args.namespace}}"
+                }[5m])
+              )
+            ) * 1000
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: trace-comparison-analysis
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: trace-comparison-analysis
+    app.kubernetes.io/component: analysis-template
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+    - name: stable-hash
+    - name: canary-hash
+  metrics:
+    # Compare canary error rate to stable
+    - name: canary-vs-stable-errors
+      interval: 60s
+      count: 5
+      successCondition: result[0] <= 1.1  # Canary errors should not exceed stable by 10%
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            (
+              sum(rate(traces_spanmetrics_calls_total{
+                service="{{args.service-name}}",
+                namespace="{{args.namespace}}",
+                version="{{args.canary-hash}}",
+                status_code="STATUS_CODE_ERROR"
+              }[5m]))
+              /
+              sum(rate(traces_spanmetrics_calls_total{
+                service="{{args.service-name}}",
+                namespace="{{args.namespace}}",
+                version="{{args.canary-hash}}"
+              }[5m]))
+            )
+            /
+            (
+              sum(rate(traces_spanmetrics_calls_total{
+                service="{{args.service-name}}",
+                namespace="{{args.namespace}}",
+                version="{{args.stable-hash}}",
+                status_code="STATUS_CODE_ERROR"
+              }[5m]))
+              /
+              sum(rate(traces_spanmetrics_calls_total{
+                service="{{args.service-name}}",
+                namespace="{{args.namespace}}",
+                version="{{args.stable-hash}}"
+              }[5m]))
+            )
+
+    # Compare canary latency to stable
+    - name: canary-vs-stable-latency
+      interval: 60s
+      count: 5
+      successCondition: result[0] <= 1.2  # Canary latency should not exceed stable by 20%
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(traces_spanmetrics_latency_bucket{
+                  service="{{args.service-name}}",
+                  namespace="{{args.namespace}}",
+                  version="{{args.canary-hash}}"
+                }[5m])
+              )
+            )
+            /
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(traces_spanmetrics_latency_bucket{
+                  service="{{args.service-name}}",
+                  namespace="{{args.namespace}}",
+                  version="{{args.stable-hash}}"
+                }[5m])
+              )
+            )
+---
+# =============================================================================
+# COMBINED GOLDEN SIGNALS ANALYSIS
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: golden-signals-analysis
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: golden-signals-analysis
+    app.kubernetes.io/component: analysis-template
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+  metrics:
+    # Latency - P99 under 500ms
+    - name: latency-p99
+      interval: 30s
+      successCondition: result[0] < 500
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(http_request_duration_seconds_bucket{
+                  namespace="{{args.namespace}}",
+                  service="{{args.service-name}}"
+                }[5m])
+              )
+            ) * 1000
+
+    # Traffic - Requests per second (just recording, no threshold)
+    - name: traffic-rps
+      interval: 30s
+      successCondition: "true"  # Always pass, just for visibility
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{
+              namespace="{{args.namespace}}",
+              service="{{args.service-name}}"
+            }[5m]))
+
+    # Errors - Error rate under 1%
+    - name: error-rate
+      interval: 30s
+      successCondition: result[0] < 0.01
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{
+              namespace="{{args.namespace}}",
+              service="{{args.service-name}}",
+              status=~"5.."
+            }[5m]))
+            /
+            sum(rate(http_requests_total{
+              namespace="{{args.namespace}}",
+              service="{{args.service-name}}"
+            }[5m]))
+
+    # Saturation - CPU under 80%
+    - name: cpu-saturation
+      interval: 60s
+      successCondition: result[0] < 0.8
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            avg(
+              rate(container_cpu_usage_seconds_total{
+                namespace="{{args.namespace}}",
+                pod=~"{{args.service-name}}.*"
+              }[5m])
+              /
+              kube_pod_container_resource_limits{
+                namespace="{{args.namespace}}",
+                pod=~"{{args.service-name}}.*",
+                resource="cpu"
+              }
+            )

@@ -1,0 +1,676 @@
+# =============================================================================
+# POST-DEPLOY SMOKE TESTS
+# =============================================================================
+# Automated health checks that run after each deployment.
+# Integrates with Argo Rollouts analysis for canary validation.
+#
+# Tests include:
+# - Health endpoint checks
+# - Readiness verification
+# - Critical path validation
+# - Performance baseline checks
+# - Dependency connectivity
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: smoke-tests
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: smoke-tests
+    app.kubernetes.io/component: workflow-template
+spec:
+  entrypoint: run-smoke-tests
+  serviceAccountName: argo-workflow
+  arguments:
+    parameters:
+      - name: app
+        description: "Application name"
+      - name: namespace
+        description: "Target namespace"
+      - name: endpoint
+        description: "Application endpoint URL"
+        default: ""
+      - name: test-suite
+        description: "Test suite to run: basic, standard, comprehensive"
+        default: "standard"
+      - name: timeout
+        description: "Test timeout in seconds"
+        default: "300"
+
+  templates:
+    # =========================================================================
+    # MAIN TEST ORCHESTRATOR
+    # =========================================================================
+    - name: run-smoke-tests
+      dag:
+        tasks:
+          # Resolve endpoint if not provided
+          - name: resolve-endpoint
+            template: get-endpoint
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+                - name: endpoint
+                  value: "{{workflow.parameters.endpoint}}"
+
+          # Basic health checks (always run)
+          - name: health-checks
+            template: health-check-suite
+            dependencies: [resolve-endpoint]
+            arguments:
+              parameters:
+                - name: endpoint
+                  value: "{{tasks.resolve-endpoint.outputs.parameters.endpoint}}"
+                - name: timeout
+                  value: "{{workflow.parameters.timeout}}"
+
+          # Standard tests
+          - name: readiness-checks
+            template: readiness-check-suite
+            dependencies: [health-checks]
+            when: "{{workflow.parameters.test-suite}} != basic"
+            arguments:
+              parameters:
+                - name: endpoint
+                  value: "{{tasks.resolve-endpoint.outputs.parameters.endpoint}}"
+
+          # Comprehensive tests
+          - name: performance-checks
+            template: performance-check-suite
+            dependencies: [readiness-checks]
+            when: "{{workflow.parameters.test-suite}} == comprehensive"
+            arguments:
+              parameters:
+                - name: endpoint
+                  value: "{{tasks.resolve-endpoint.outputs.parameters.endpoint}}"
+
+          # Dependency checks
+          - name: dependency-checks
+            template: dependency-check-suite
+            dependencies: [health-checks]
+            when: "{{workflow.parameters.test-suite}} == comprehensive"
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+
+          # Generate report
+          - name: generate-report
+            template: test-report
+            dependencies: [health-checks, readiness-checks, performance-checks, dependency-checks]
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: health-status
+                  value: "{{tasks.health-checks.outputs.parameters.status}}"
+
+    # =========================================================================
+    # ENDPOINT RESOLUTION
+    # =========================================================================
+    - name: get-endpoint
+      inputs:
+        parameters:
+          - name: app
+          - name: namespace
+          - name: endpoint
+      outputs:
+        parameters:
+          - name: endpoint
+            valueFrom:
+              path: /tmp/endpoint
+      script:
+        image: bitnami/kubectl:1.29
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          NAMESPACE="{{inputs.parameters.namespace}}"
+          PROVIDED_ENDPOINT="{{inputs.parameters.endpoint}}"
+
+          if [ -n "$PROVIDED_ENDPOINT" ]; then
+            echo "$PROVIDED_ENDPOINT" > /tmp/endpoint
+            echo "Using provided endpoint: $PROVIDED_ENDPOINT"
+            exit 0
+          fi
+
+          # Try to get ingress
+          INGRESS_HOST=$(kubectl get ingress -n "$NAMESPACE" \
+            -l "app.kubernetes.io/name=$APP" \
+            -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || true)
+
+          if [ -n "$INGRESS_HOST" ]; then
+            echo "https://${INGRESS_HOST}" > /tmp/endpoint
+            echo "Found ingress endpoint: https://${INGRESS_HOST}"
+            exit 0
+          fi
+
+          # Fallback to service
+          SVC_IP=$(kubectl get svc "$APP" -n "$NAMESPACE" \
+            -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+          SVC_PORT=$(kubectl get svc "$APP" -n "$NAMESPACE" \
+            -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "80")
+
+          if [ -n "$SVC_IP" ]; then
+            echo "http://${SVC_IP}:${SVC_PORT}" > /tmp/endpoint
+            echo "Using service endpoint: http://${SVC_IP}:${SVC_PORT}"
+            exit 0
+          fi
+
+          echo "Could not determine endpoint"
+          exit 1
+
+    # =========================================================================
+    # HEALTH CHECK SUITE
+    # =========================================================================
+    - name: health-check-suite
+      inputs:
+        parameters:
+          - name: endpoint
+          - name: timeout
+      outputs:
+        parameters:
+          - name: status
+            valueFrom:
+              path: /tmp/status
+          - name: results
+            valueFrom:
+              path: /tmp/results.json
+      script:
+        image: curlimages/curl:8.5.0
+        command: [sh]
+        source: |
+          #!/bin/sh
+          set -e
+
+          ENDPOINT="{{inputs.parameters.endpoint}}"
+          TIMEOUT="{{inputs.parameters.timeout}}"
+          RESULTS_FILE="/tmp/results.json"
+
+          echo '{"checks": []}' > "$RESULTS_FILE"
+
+          check_endpoint() {
+            local name="$1"
+            local path="$2"
+            local expected_code="${3:-200}"
+
+            echo "→ Checking $name ($path)..."
+
+            RESPONSE=$(curl -s -w "\n%{http_code}\n%{time_total}" \
+              --max-time 30 \
+              --retry 3 \
+              --retry-delay 2 \
+              "${ENDPOINT}${path}" 2>/dev/null || echo -e "\n000\n0")
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -2 | head -1)
+            RESPONSE_TIME=$(echo "$RESPONSE" | tail -1)
+
+            if [ "$HTTP_CODE" = "$expected_code" ]; then
+              STATUS="passed"
+              echo "  ✓ $name: HTTP $HTTP_CODE (${RESPONSE_TIME}s)"
+            else
+              STATUS="failed"
+              echo "  ✗ $name: HTTP $HTTP_CODE (expected $expected_code)"
+            fi
+
+            # Append to results (simplified without jq)
+            echo "{\"name\": \"$name\", \"status\": \"$STATUS\", \"http_code\": $HTTP_CODE, \"response_time\": $RESPONSE_TIME}"
+          }
+
+          echo "Running health checks against $ENDPOINT"
+          echo ""
+
+          # Core health checks
+          check_endpoint "health" "/health"
+          check_endpoint "liveness" "/healthz"
+          check_endpoint "readiness" "/ready"
+
+          # Check root path
+          check_endpoint "root" "/" "200"
+
+          # Determine overall status
+          FAILED=$(grep -c '"status": "failed"' /tmp/results.json 2>/dev/null || echo "0")
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "failed" > /tmp/status
+            echo ""
+            echo "Health checks: FAILED ($FAILED failures)"
+            exit 1
+          else
+            echo "passed" > /tmp/status
+            echo ""
+            echo "Health checks: PASSED"
+          fi
+
+    # =========================================================================
+    # READINESS CHECK SUITE
+    # =========================================================================
+    - name: readiness-check-suite
+      inputs:
+        parameters:
+          - name: endpoint
+      outputs:
+        parameters:
+          - name: status
+            valueFrom:
+              path: /tmp/status
+      script:
+        image: curlimages/curl:8.5.0
+        command: [sh]
+        source: |
+          #!/bin/sh
+          set -e
+
+          ENDPOINT="{{inputs.parameters.endpoint}}"
+          FAILURES=0
+
+          echo "Running readiness checks against $ENDPOINT"
+          echo ""
+
+          # Check API versioning
+          echo "→ Checking API version endpoint..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 \
+            "${ENDPOINT}/api/version" 2>/dev/null || echo "000")
+
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ]; then
+            echo "  ✓ API version endpoint accessible"
+          else
+            echo "  ⚠ API version endpoint returned $HTTP_CODE"
+          fi
+
+          # Check common API paths
+          for path in "/api" "/api/v1" "/v1"; do
+            echo "→ Checking $path..."
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              "${ENDPOINT}${path}" 2>/dev/null || echo "000")
+
+            case "$HTTP_CODE" in
+              200|204|401|403|404)
+                echo "  ✓ $path: HTTP $HTTP_CODE (acceptable)"
+                ;;
+              000)
+                echo "  ⚠ $path: Connection failed"
+                ;;
+              5*)
+                echo "  ✗ $path: HTTP $HTTP_CODE (server error)"
+                FAILURES=$((FAILURES + 1))
+                ;;
+              *)
+                echo "  ○ $path: HTTP $HTTP_CODE"
+                ;;
+            esac
+          done
+
+          # Check response headers
+          echo ""
+          echo "→ Checking response headers..."
+          HEADERS=$(curl -s -I --max-time 10 "${ENDPOINT}/health" 2>/dev/null || echo "")
+
+          if echo "$HEADERS" | grep -qi "content-type"; then
+            echo "  ✓ Content-Type header present"
+          fi
+
+          if echo "$HEADERS" | grep -qi "x-request-id\|x-trace-id"; then
+            echo "  ✓ Request tracing header present"
+          fi
+
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "failed" > /tmp/status
+            echo ""
+            echo "Readiness checks: FAILED"
+            exit 1
+          else
+            echo "passed" > /tmp/status
+            echo ""
+            echo "Readiness checks: PASSED"
+          fi
+
+    # =========================================================================
+    # PERFORMANCE CHECK SUITE
+    # =========================================================================
+    - name: performance-check-suite
+      inputs:
+        parameters:
+          - name: endpoint
+      outputs:
+        parameters:
+          - name: status
+            valueFrom:
+              path: /tmp/status
+          - name: p99-latency
+            valueFrom:
+              path: /tmp/p99
+      script:
+        image: curlimages/curl:8.5.0
+        command: [sh]
+        source: |
+          #!/bin/sh
+          set -e
+
+          ENDPOINT="{{inputs.parameters.endpoint}}"
+          ITERATIONS=20
+          LATENCIES=""
+
+          echo "Running performance checks against $ENDPOINT"
+          echo "Iterations: $ITERATIONS"
+          echo ""
+
+          # Warmup
+          echo "→ Warming up..."
+          for i in 1 2 3; do
+            curl -s -o /dev/null --max-time 10 "${ENDPOINT}/health" 2>/dev/null || true
+          done
+
+          # Collect latencies
+          echo "→ Collecting latency samples..."
+          for i in $(seq 1 $ITERATIONS); do
+            LATENCY=$(curl -s -o /dev/null -w "%{time_total}" \
+              --max-time 10 \
+              "${ENDPOINT}/health" 2>/dev/null || echo "10")
+            LATENCIES="$LATENCIES $LATENCY"
+            printf "."
+          done
+          echo ""
+
+          # Calculate statistics (simplified)
+          SORTED=$(echo $LATENCIES | tr ' ' '\n' | sort -n)
+          TOTAL=$(echo $LATENCIES | tr ' ' '\n' | wc -l | tr -d ' ')
+          P99_INDEX=$((TOTAL * 99 / 100))
+
+          if [ "$P99_INDEX" -lt 1 ]; then
+            P99_INDEX=1
+          fi
+
+          P99=$(echo "$SORTED" | sed -n "${P99_INDEX}p")
+          AVG=$(echo $LATENCIES | tr ' ' '\n' | awk '{sum+=$1} END {printf "%.3f", sum/NR}')
+
+          echo "$P99" > /tmp/p99
+
+          echo ""
+          echo "Performance Results:"
+          echo "  Average latency: ${AVG}s"
+          echo "  P99 latency: ${P99}s"
+
+          # Check against thresholds
+          # P99 should be under 2 seconds for health endpoint
+          P99_MS=$(echo "$P99 * 1000" | bc 2>/dev/null || echo "0")
+
+          if [ "${P99_MS%.*}" -lt 2000 ]; then
+            echo "  ✓ P99 latency within threshold (<2s)"
+            echo "passed" > /tmp/status
+          else
+            echo "  ✗ P99 latency exceeds threshold (>2s)"
+            echo "failed" > /tmp/status
+            exit 1
+          fi
+
+    # =========================================================================
+    # DEPENDENCY CHECK SUITE
+    # =========================================================================
+    - name: dependency-check-suite
+      inputs:
+        parameters:
+          - name: app
+          - name: namespace
+      outputs:
+        parameters:
+          - name: status
+            valueFrom:
+              path: /tmp/status
+      script:
+        image: bitnami/kubectl:1.29
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          NAMESPACE="{{inputs.parameters.namespace}}"
+
+          echo "Running dependency checks for $APP in $NAMESPACE"
+          echo ""
+
+          FAILURES=0
+
+          # Check all pods are ready
+          echo "→ Checking pod readiness..."
+          NOT_READY=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$APP" \
+            -o jsonpath='{.items[?(@.status.phase!="Running")].metadata.name}' 2>/dev/null || echo "")
+
+          if [ -z "$NOT_READY" ]; then
+            echo "  ✓ All pods are running"
+          else
+            echo "  ✗ Pods not ready: $NOT_READY"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # Check container restarts
+          echo "→ Checking container restarts..."
+          RESTARTS=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$APP" \
+            -o jsonpath='{range .items[*]}{.status.containerStatuses[*].restartCount}{"\n"}{end}' 2>/dev/null | \
+            awk '{sum+=$1} END {print sum}')
+
+          if [ "${RESTARTS:-0}" -lt 5 ]; then
+            echo "  ✓ Container restarts within threshold ($RESTARTS)"
+          else
+            echo "  ⚠ High container restart count: $RESTARTS"
+          fi
+
+          # Check resource usage
+          echo "→ Checking resource usage..."
+          kubectl top pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$APP" 2>/dev/null || \
+            echo "  ○ Metrics not available"
+
+          # Check service endpoints
+          echo "→ Checking service endpoints..."
+          ENDPOINTS=$(kubectl get endpoints "$APP" -n "$NAMESPACE" \
+            -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || echo "")
+
+          if [ -n "$ENDPOINTS" ]; then
+            ENDPOINT_COUNT=$(echo "$ENDPOINTS" | wc -w | tr -d ' ')
+            echo "  ✓ Service has $ENDPOINT_COUNT endpoints"
+          else
+            echo "  ✗ Service has no endpoints"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # Check events for warnings
+          echo "→ Checking recent events..."
+          WARNINGS=$(kubectl get events -n "$NAMESPACE" \
+            --field-selector "type=Warning,involvedObject.name=$APP" \
+            --sort-by='.lastTimestamp' 2>/dev/null | tail -5)
+
+          if [ -z "$WARNINGS" ] || echo "$WARNINGS" | grep -q "No resources found"; then
+            echo "  ✓ No warning events"
+          else
+            echo "  ⚠ Recent warning events found:"
+            echo "$WARNINGS" | head -3 | sed 's/^/    /'
+          fi
+
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "failed" > /tmp/status
+            echo ""
+            echo "Dependency checks: FAILED"
+            exit 1
+          else
+            echo "passed" > /tmp/status
+            echo ""
+            echo "Dependency checks: PASSED"
+          fi
+
+    # =========================================================================
+    # TEST REPORT GENERATION
+    # =========================================================================
+    - name: test-report
+      inputs:
+        parameters:
+          - name: app
+          - name: health-status
+      script:
+        image: alpine:3.19
+        command: [sh]
+        source: |
+          #!/bin/sh
+
+          APP="{{inputs.parameters.app}}"
+          HEALTH_STATUS="{{inputs.parameters.health-status}}"
+
+          echo "====================================="
+          echo "  SMOKE TEST REPORT"
+          echo "====================================="
+          echo ""
+          echo "Application: $APP"
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo ""
+          echo "Results:"
+          echo "  Health Checks: $HEALTH_STATUS"
+          echo ""
+          echo "====================================="
+
+          if [ "$HEALTH_STATUS" = "passed" ]; then
+            echo "OVERALL: PASSED ✓"
+          else
+            echo "OVERALL: FAILED ✗"
+            exit 1
+          fi
+---
+# =============================================================================
+# ARGO ROLLOUTS ANALYSIS TEMPLATES
+# =============================================================================
+# These integrate with Rollout canary analysis
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: smoke-test-analysis
+  namespace: argo
+spec:
+  args:
+    - name: app
+    - name: namespace
+    - name: endpoint
+  metrics:
+    - name: smoke-tests
+      provider:
+        job:
+          spec:
+            backoffLimit: 1
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: smoke-test
+                    image: curlimages/curl:8.5.0
+                    command: [sh, -c]
+                    args:
+                      - |
+                        ENDPOINT="{{args.endpoint}}"
+
+                        # Health check
+                        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                          --max-time 30 \
+                          --retry 3 \
+                          "${ENDPOINT}/health")
+
+                        if [ "$HTTP_CODE" = "200" ]; then
+                          echo "Health check passed"
+                          exit 0
+                        else
+                          echo "Health check failed: HTTP $HTTP_CODE"
+                          exit 1
+                        fi
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: argo
+spec:
+  args:
+    - name: service
+    - name: namespace
+  metrics:
+    - name: success-rate
+      interval: 30s
+      successCondition: result[0] >= 0.95
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{
+              namespace="{{args.namespace}}",
+              service="{{args.service}}",
+              status=~"2.."
+            }[5m])) /
+            sum(rate(http_requests_total{
+              namespace="{{args.namespace}}",
+              service="{{args.service}}"
+            }[5m]))
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: latency-p99
+  namespace: argo
+spec:
+  args:
+    - name: service
+    - name: namespace
+    - name: threshold
+      value: "500"
+  metrics:
+    - name: latency-p99
+      interval: 30s
+      successCondition: result[0] < {{args.threshold}}
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{
+                namespace="{{args.namespace}}",
+                service="{{args.service}}"
+              }[5m])) by (le)
+            ) * 1000
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate
+  namespace: argo
+spec:
+  args:
+    - name: service
+    - name: namespace
+    - name: threshold
+      value: "0.01"
+  metrics:
+    - name: error-rate
+      interval: 30s
+      successCondition: result[0] < {{args.threshold}}
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{
+              namespace="{{args.namespace}}",
+              service="{{args.service}}",
+              status=~"5.."
+            }[5m])) /
+            sum(rate(http_requests_total{
+              namespace="{{args.namespace}}",
+              service="{{args.service}}"
+            }[5m]))

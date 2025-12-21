@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubecost-reports-config
+  namespace: kubecost
+  labels:
+    app.kubernetes.io/name: kubecost-reports-config
+    app.kubernetes.io/part-of: cost-management
+data:
+  reports.yaml: |
+    # Weekly team cost reports
+    reports:
+      - name: team-weekly-summary
+        schedule: "0 9 * * 1"
+        window: 7d
+        aggregation: namespace
+        filter:
+          namespaces: "team-*"
+        recipients:
+          - type: slack
+            channel: "#platform-costs"
+        format: markdown
+        includeEfficiency: true
+        includeRecommendations: true
+
+      - name: team-monthly-detailed
+        schedule: "0 9 1 * *"
+        window: lastMonth
+        aggregation: label:app.kubernetes.io/team
+        recipients:
+          - type: slack
+            channel: "#platform-costs"
+        format: markdown
+        includeEfficiency: true
+        includeRecommendations: true
+
+    # Anomaly detection
+    anomalyDetection:
+      enabled: true
+      threshold: 0.3
+      window: 7d
+      alertChannel: "#cost-alerts"
+
+    # Budget alerts
+    budgets:
+      - name: team-backend
+        namespace: team-backend
+        monthlyBudget: 500
+        alertThresholds: [0.75, 0.9, 1.0]
+        alertChannel: "#backend-eng"
+
+      - name: team-frontend
+        namespace: team-frontend
+        monthlyBudget: 300
+        alertThresholds: [0.75, 0.9, 1.0]
+        alertChannel: "#frontend-eng"
+
+      - name: team-data
+        namespace: team-data
+        monthlyBudget: 1000
+        alertThresholds: [0.75, 0.9, 1.0]
+        alertChannel: "#data-eng"
+
+      - name: team-ml
+        namespace: team-ml
+        monthlyBudget: 1500
+        alertThresholds: [0.75, 0.9, 1.0]
+        alertChannel: "#ml-eng"
+
+      - name: platform-total
+        namespace: "*"
+        monthlyBudget: 5000
+        alertThresholds: [0.8, 0.95, 1.0]
+        alertChannel: "#platform-costs"

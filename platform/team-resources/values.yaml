@@ -1,0 +1,39 @@
+# Default values - overridden by ApplicationSet
+team:
+  name: ""
+  namespace: ""
+  description: ""
+
+owner:
+  name: ""
+  email: ""
+  slack: ""
+
+resourceQuota:
+  requests:
+    cpu: "10"
+    memory: "20Gi"
+  limits:
+    cpu: "20"
+    memory: "40Gi"
+  pods: "30"
+  services: "10"
+  configmaps: "20"
+  secrets: "20"
+  persistentvolumeclaims: "5"
+
+limitRange:
+  default:
+    cpu: "500m"
+    memory: "512Mi"
+  defaultRequest:
+    cpu: "100m"
+    memory: "128Mi"
+  max:
+    cpu: "2"
+    memory: "4Gi"
+
+networkPolicy:
+  allowIngress: true
+  allowEgress: true
+  allowFromNamespacesRaw: ""  # Comma-separated list of namespaces

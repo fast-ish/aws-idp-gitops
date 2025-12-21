@@ -1,0 +1,201 @@
+# Cost Alerting Rules using OpenCost metrics
+# OpenCost is deployed via k8s-monitoring Helm chart (CDK)
+# These rules are applied via GitOps and picked up by Grafana Cloud
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: opencost-alerts
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: opencost-alerts
+    app.kubernetes.io/part-of: observability
+    prometheus: k8s-monitoring
+spec:
+  groups:
+    - name: cost.budget
+      interval: 5m
+      rules:
+        # Namespace daily cost threshold
+        - alert: NamespaceDailyCostHigh
+          expr: |
+            sum by (namespace) (
+              opencost_allocation_cost{namespace=~"team-.*"}
+            ) > 50
+          for: 1h
+          labels:
+            severity: warning
+            category: cost
+          annotations:
+            summary: "High daily cost in namespace {{ $labels.namespace }}"
+            description: "Namespace {{ $labels.namespace }} daily cost is ${{ $value | printf \"%.2f\" }}, exceeding $50 threshold."
+            runbook_url: "https://wiki.internal/runbooks/cost-optimization"
+
+        # Cluster-wide daily cost threshold
+        - alert: ClusterDailyCostHigh
+          expr: |
+            sum(opencost_allocation_cost) > 500
+          for: 2h
+          labels:
+            severity: warning
+            category: cost
+          annotations:
+            summary: "High cluster daily cost"
+            description: "Total cluster daily cost is ${{ $value | printf \"%.2f\" }}, exceeding $500 threshold."
+
+    - name: cost.anomaly
+      interval: 10m
+      rules:
+        # Cost spike detection (25% increase over previous day)
+        - alert: CostSpikeDetected
+          expr: |
+            (
+              sum(opencost_allocation_cost) -
+              sum(opencost_allocation_cost offset 1d)
+            ) / sum(opencost_allocation_cost offset 1d) > 0.25
+          for: 2h
+          labels:
+            severity: warning
+            category: cost
+          annotations:
+            summary: "Cost spike detected ({{ $value | humanizePercentage }} increase)"
+            description: "Cluster costs increased by {{ $value | humanizePercentage }} compared to yesterday. Investigate new deployments or scaling events."
+
+        # Namespace cost anomaly (50% above 7-day average)
+        - alert: NamespaceCostAnomaly
+          expr: |
+            (
+              sum by (namespace) (opencost_allocation_cost{namespace=~"team-.*"}) -
+              avg_over_time(sum by (namespace) (opencost_allocation_cost{namespace=~"team-.*"})[7d:1h])
+            ) / avg_over_time(sum by (namespace) (opencost_allocation_cost{namespace=~"team-.*"})[7d:1h]) > 0.5
+          for: 4h
+          labels:
+            severity: warning
+            category: cost
+          annotations:
+            summary: "Cost anomaly in namespace {{ $labels.namespace }}"
+            description: "Daily cost is 50% higher than 7-day average in namespace {{ $labels.namespace }}."
+
+    - name: cost.efficiency
+      interval: 15m
+      rules:
+        # Low CPU efficiency (requests vs actual usage)
+        - alert: LowCPUEfficiency
+          expr: |
+            (
+              sum by (namespace) (rate(container_cpu_usage_seconds_total{namespace=~"team-.*", container!="", container!="POD"}[1h]))
+              /
+              sum by (namespace) (kube_pod_container_resource_requests{namespace=~"team-.*", resource="cpu", container!=""})
+            ) < 0.2
+          for: 24h
+          labels:
+            severity: info
+            category: efficiency
+          annotations:
+            summary: "Low CPU efficiency in {{ $labels.namespace }} ({{ $value | humanizePercentage }})"
+            description: "CPU utilization is below 20% of requested. Consider reducing CPU requests to save costs."
+
+        # Low memory efficiency
+        - alert: LowMemoryEfficiency
+          expr: |
+            (
+              sum by (namespace) (container_memory_working_set_bytes{namespace=~"team-.*", container!="", container!="POD"})
+              /
+              sum by (namespace) (kube_pod_container_resource_requests{namespace=~"team-.*", resource="memory", container!=""})
+            ) < 0.3
+          for: 24h
+          labels:
+            severity: info
+            category: efficiency
+          annotations:
+            summary: "Low memory efficiency in {{ $labels.namespace }} ({{ $value | humanizePercentage }})"
+            description: "Memory utilization is below 30% of requested. Consider reducing memory requests."
+
+        # High idle cost ratio
+        - alert: HighIdleCostRatio
+          expr: |
+            (
+              sum(opencost_allocation_idle_cost)
+              /
+              sum(opencost_allocation_cost)
+            ) > 0.35
+          for: 24h
+          labels:
+            severity: info
+            category: efficiency
+          annotations:
+            summary: "High idle cost ratio ({{ $value | humanizePercentage }})"
+            description: "35% or more of cluster cost is idle. Consider right-sizing or consolidating workloads."
+
+    - name: cost.spot
+      interval: 30m
+      rules:
+        # Low spot instance usage
+        - alert: LowSpotInstanceUsage
+          expr: |
+            (
+              count(kube_node_labels{label_node_lifecycle="spot"} == 1)
+              /
+              count(kube_node_labels)
+            ) < 0.5
+          for: 7d
+          labels:
+            severity: info
+            category: optimization
+          annotations:
+            summary: "Low spot instance usage ({{ $value | humanizePercentage }})"
+            description: "Less than 50% of nodes are spot instances. Consider migrating fault-tolerant workloads to spot for cost savings."
+
+        # Namespace not using spot
+        - alert: NamespaceNotUsingSpot
+          expr: |
+            (
+              count by (namespace) (
+                kube_pod_info{namespace=~"team-.*"}
+                * on (node) group_left()
+                kube_node_labels{label_node_lifecycle="spot"}
+              )
+              /
+              count by (namespace) (kube_pod_info{namespace=~"team-.*"})
+            ) < 0.3
+          for: 7d
+          labels:
+            severity: info
+            category: optimization
+          annotations:
+            summary: "Low spot usage in {{ $labels.namespace }}"
+            description: "Less than 30% of pods in {{ $labels.namespace }} run on spot instances."
+
+    - name: cost.resources
+      interval: 10m
+      rules:
+        # Pods without resource requests
+        - alert: PodsWithoutResourceRequests
+          expr: |
+            count by (namespace) (
+              kube_pod_container_resource_requests{namespace=~"team-.*", resource="cpu"} == 0
+              or
+              kube_pod_container_resource_requests{namespace=~"team-.*", resource="memory"} == 0
+            ) > 0
+          for: 1h
+          labels:
+            severity: warning
+            category: governance
+          annotations:
+            summary: "Pods without resource requests in {{ $labels.namespace }}"
+            description: "{{ $value }} containers in {{ $labels.namespace }} lack CPU or memory requests. This impacts cost allocation accuracy."
+
+        # Over-provisioned pods (limits >> usage)
+        - alert: OverProvisionedPods
+          expr: |
+            (
+              sum by (namespace, pod) (kube_pod_container_resource_limits{namespace=~"team-.*", resource="memory"})
+              /
+              sum by (namespace, pod) (container_memory_working_set_bytes{namespace=~"team-.*"})
+            ) > 5
+          for: 24h
+          labels:
+            severity: info
+            category: efficiency
+          annotations:
+            summary: "Over-provisioned pod {{ $labels.pod }} in {{ $labels.namespace }}"
+            description: "Memory limits are 5x higher than actual usage. Consider reducing limits."

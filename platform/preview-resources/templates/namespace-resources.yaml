@@ -1,0 +1,144 @@
+{{- $namespace := .Values.namespace -}}
+{{- $app := .Values.app -}}
+{{- $prNumber := .Values.prNumber -}}
+{{- $ttlHours := .Values.ttlHours | default 72 -}}
+---
+# =============================================================================
+# RESOURCE QUOTA FOR PREVIEW ENVIRONMENTS
+# =============================================================================
+# Limits resources to ~25% of production to control costs
+# =============================================================================
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: preview-quota
+  namespace: {{ $namespace }}
+  labels:
+    fasti.sh/environment: preview
+    fasti.sh/pr: "{{ $prNumber }}"
+  annotations:
+    fasti.sh/ttl: "{{ $ttlHours }}h"
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: "4Gi"
+    limits.cpu: "4"
+    limits.memory: "8Gi"
+    pods: "10"
+    services: "5"
+    configmaps: "10"
+    secrets: "10"
+    persistentvolumeclaims: "2"
+---
+# =============================================================================
+# LIMIT RANGE FOR PREVIEW CONTAINERS
+# =============================================================================
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: preview-limits
+  namespace: {{ $namespace }}
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "200m"
+        memory: "256Mi"
+      defaultRequest:
+        cpu: "50m"
+        memory: "64Mi"
+      max:
+        cpu: "1"
+        memory: "1Gi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "5Gi"
+---
+# =============================================================================
+# NETWORK POLICY - ISOLATE PREVIEW ENVIRONMENTS
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: preview-isolation
+  namespace: {{ $namespace }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+    # Allow within namespace
+    - from:
+        - podSelector: {}
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow external (for APIs, etc)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+---
+# =============================================================================
+# INGRESS FOR PREVIEW ENVIRONMENT
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: preview-ingress
+  namespace: {{ $namespace }}
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/group.name: previews
+    external-dns.alpha.kubernetes.io/hostname: pr-{{ $prNumber }}.{{ $app }}.preview.fasti.sh
+spec:
+  rules:
+    - host: pr-{{ $prNumber }}.{{ $app }}.preview.fasti.sh
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $app }}-pr-{{ $prNumber }}
+                port:
+                  number: 80
+---
+# =============================================================================
+# TTL ANNOTATION FOR CLEANUP
+# =============================================================================
+# The preview-cleaner CronJob reads this to delete old previews
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: preview-metadata
+  namespace: {{ $namespace }}
+  labels:
+    fasti.sh/preview: "true"
+    fasti.sh/pr: "{{ $prNumber }}"
+  annotations:
+    fasti.sh/created-at: "{{ now | date "2006-01-02T15:04:05Z07:00" }}"
+    fasti.sh/ttl-hours: "{{ $ttlHours }}"
+    fasti.sh/app: "{{ $app }}"
+data:
+  app: "{{ $app }}"
+  prNumber: "{{ $prNumber }}"
+  ttlHours: "{{ $ttlHours }}"

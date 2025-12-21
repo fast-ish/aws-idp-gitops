@@ -1,0 +1,101 @@
+global:
+  prometheus:
+    enabled: true
+    fqdn: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+
+kubecostProductConfigs:
+  clusterName: production
+  currencyCode: USD
+
+  # Cost allocation labels
+  labelMappingConfigs:
+    enabled: true
+    team_label: "app.kubernetes.io/team"
+    environment_label: "app.kubernetes.io/environment"
+    department_label: "app.kubernetes.io/department"
+    product_label: "app.kubernetes.io/name"
+
+  # Shared cost allocation
+  sharedNamespaces: "kube-system,karpenter,argocd,argo,external-secrets,kyverno,observability,falco,trivy-system,cert-manager"
+  shareTenancyCosts: true
+  sharedLabelNames: "app.kubernetes.io/team"
+
+  # AWS Spot pricing
+  awsSpotDataRegion: us-west-2
+  awsSpotDataBucket: ""
+  spotLabel: "karpenter.sh/capacity-type"
+  spotLabelValue: "spot"
+
+  # Cost allocation aggregation
+  defaultIdleCost: 0.75
+  idleCostRatio: 0.75
+  shareIdleCost: true
+
+persistentVolume:
+  enabled: true
+  size: 32Gi
+  storageClass: gp3
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+  hosts:
+    - kubecost.internal.fasti.sh
+  paths:
+    - /
+
+kubecostModel:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+kubecostFrontend:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+prometheus:
+  server:
+    enabled: false
+  alertmanager:
+    enabled: false
+  nodeExporter:
+    enabled: false
+  pushgateway:
+    enabled: false
+  kubeStateMetrics:
+    enabled: false
+
+grafana:
+  enabled: false
+  proxy: false
+
+serviceMonitor:
+  enabled: true
+
+networkCosts:
+  enabled: true
+  config:
+    services:
+      amazon-web-services: true
+
+cloudIntegrationSecret: kubecost-cloud-integration
+
+reporting:
+  productAnalytics: false
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: ""

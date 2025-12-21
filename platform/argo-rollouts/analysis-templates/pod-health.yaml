@@ -1,0 +1,107 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: pod-cpu
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: pod-cpu
+    app.kubernetes.io/component: analysis-template
+    app.kubernetes.io/part-of: argo-rollouts
+spec:
+  args:
+    - name: pod-hash
+    - name: namespace
+    - name: threshold
+      value: "0.8"
+  metrics:
+    - name: pod-cpu
+      interval: 30s
+      count: 5
+      successCondition: result[0] < {{args.threshold}}
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.observability.svc.cluster.local:9090
+          query: |
+            avg(
+              rate(container_cpu_usage_seconds_total{
+                namespace="{{args.namespace}}",
+                pod=~".*-{{args.pod-hash}}.*"
+              }[5m])
+            ) /
+            avg(
+              container_spec_cpu_quota{
+                namespace="{{args.namespace}}",
+                pod=~".*-{{args.pod-hash}}.*"
+              } / container_spec_cpu_period
+            )
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: pod-memory
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: pod-memory
+    app.kubernetes.io/component: analysis-template
+    app.kubernetes.io/part-of: argo-rollouts
+spec:
+  args:
+    - name: pod-hash
+    - name: namespace
+    - name: threshold
+      value: "0.8"
+  metrics:
+    - name: pod-memory
+      interval: 30s
+      count: 5
+      successCondition: result[0] < {{args.threshold}}
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.observability.svc.cluster.local:9090
+          query: |
+            avg(
+              container_memory_working_set_bytes{
+                namespace="{{args.namespace}}",
+                pod=~".*-{{args.pod-hash}}.*"
+              }
+            ) /
+            avg(
+              container_spec_memory_limit_bytes{
+                namespace="{{args.namespace}}",
+                pod=~".*-{{args.pod-hash}}.*"
+              }
+            )
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: pod-restarts
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: pod-restarts
+    app.kubernetes.io/component: analysis-template
+    app.kubernetes.io/part-of: argo-rollouts
+spec:
+  args:
+    - name: pod-hash
+    - name: namespace
+  metrics:
+    - name: pod-restarts
+      interval: 60s
+      count: 5
+      successCondition: result[0] == 0
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.observability.svc.cluster.local:9090
+          query: |
+            sum(
+              increase(
+                kube_pod_container_status_restarts_total{
+                  namespace="{{args.namespace}}",
+                  pod=~".*-{{args.pod-hash}}.*"
+                }[5m]
+              )
+            )

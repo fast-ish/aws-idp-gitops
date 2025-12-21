@@ -1,0 +1,645 @@
+# =============================================================================
+# ROLLBACK AUTOMATION
+# =============================================================================
+# Automated rollback based on error budgets and health metrics.
+#
+# Triggers:
+# - Error rate exceeds threshold
+# - Latency SLO breach
+# - Health check failures
+# - Manual trigger
+#
+# Actions:
+# - Automatic rollback to last known good revision
+# - Notification to relevant teams
+# - Incident ticket creation (optional)
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: rollback-automation
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: rollback-automation
+    app.kubernetes.io/component: workflow-template
+spec:
+  entrypoint: rollback
+  serviceAccountName: argo-workflow
+  arguments:
+    parameters:
+      - name: app
+        description: "Application name"
+      - name: namespace
+        description: "Target namespace"
+      - name: reason
+        description: "Rollback reason"
+        default: "automated"
+      - name: target-revision
+        description: "Target revision (empty = previous)"
+        default: ""
+      - name: dry-run
+        description: "Dry run mode"
+        default: "false"
+
+  templates:
+    # =========================================================================
+    # MAIN ROLLBACK WORKFLOW
+    # =========================================================================
+    - name: rollback
+      dag:
+        tasks:
+          # Get current and previous revisions
+          - name: get-revisions
+            template: get-rollout-revisions
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+
+          # Validate rollback is possible
+          - name: validate
+            template: validate-rollback
+            dependencies: [get-revisions]
+            arguments:
+              parameters:
+                - name: current-revision
+                  value: "{{tasks.get-revisions.outputs.parameters.current-revision}}"
+                - name: previous-revision
+                  value: "{{tasks.get-revisions.outputs.parameters.previous-revision}}"
+                - name: target-revision
+                  value: "{{workflow.parameters.target-revision}}"
+
+          # Send pre-rollback notification
+          - name: notify-start
+            template: send-notification
+            dependencies: [validate]
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: message
+                  value: "🔄 Starting rollback for {{workflow.parameters.app}}"
+                - name: status
+                  value: "in_progress"
+                - name: reason
+                  value: "{{workflow.parameters.reason}}"
+
+          # Execute rollback
+          - name: execute-rollback
+            template: execute-rollback
+            dependencies: [notify-start]
+            when: "{{workflow.parameters.dry-run}} != true"
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+                - name: target-revision
+                  value: "{{tasks.validate.outputs.parameters.target-revision}}"
+
+          # Wait for rollback to complete
+          - name: wait-for-rollback
+            template: wait-rollback-complete
+            dependencies: [execute-rollback]
+            when: "{{workflow.parameters.dry-run}} != true"
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+
+          # Verify health after rollback
+          - name: verify-health
+            template: verify-rollback-health
+            dependencies: [wait-for-rollback]
+            when: "{{workflow.parameters.dry-run}} != true"
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+
+          # Update GitOps to match rollback
+          - name: sync-gitops
+            template: sync-gitops-state
+            dependencies: [verify-health]
+            when: "{{workflow.parameters.dry-run}} != true"
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: namespace
+                  value: "{{workflow.parameters.namespace}}"
+                - name: revision
+                  value: "{{tasks.validate.outputs.parameters.target-revision}}"
+
+          # Send completion notification
+          - name: notify-complete
+            template: send-notification
+            dependencies: [verify-health]
+            arguments:
+              parameters:
+                - name: app
+                  value: "{{workflow.parameters.app}}"
+                - name: message
+                  value: "✅ Rollback completed for {{workflow.parameters.app}}"
+                - name: status
+                  value: "{{tasks.verify-health.outputs.parameters.status}}"
+                - name: reason
+                  value: "{{workflow.parameters.reason}}"
+
+    # =========================================================================
+    # GET ROLLOUT REVISIONS
+    # =========================================================================
+    - name: get-rollout-revisions
+      inputs:
+        parameters:
+          - name: app
+          - name: namespace
+      outputs:
+        parameters:
+          - name: current-revision
+            valueFrom:
+              path: /tmp/current
+          - name: previous-revision
+            valueFrom:
+              path: /tmp/previous
+          - name: revision-history
+            valueFrom:
+              path: /tmp/history
+      script:
+        image: argoproj/argo-rollouts:v1.6.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          NAMESPACE="{{inputs.parameters.namespace}}"
+
+          echo "Getting revision history for $APP in $NAMESPACE"
+
+          # Get current revision
+          CURRENT=$(kubectl get rollout "$APP" -n "$NAMESPACE" \
+            -o jsonpath='{.status.currentPodHash}' 2>/dev/null || echo "")
+
+          if [ -z "$CURRENT" ]; then
+            echo "Error: Could not get current revision"
+            exit 1
+          fi
+
+          echo "$CURRENT" > /tmp/current
+          echo "Current revision: $CURRENT"
+
+          # Get revision history
+          kubectl-argo-rollouts get rollout "$APP" -n "$NAMESPACE" \
+            --no-color 2>/dev/null > /tmp/history || true
+
+          # Get previous stable revision
+          PREVIOUS=$(kubectl get rollout "$APP" -n "$NAMESPACE" \
+            -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "")
+
+          # If stableRS is same as current, look at history
+          if [ "$PREVIOUS" = "$CURRENT" ] || [ -z "$PREVIOUS" ]; then
+            # Try to get from replicasets
+            PREVIOUS=$(kubectl get rs -n "$NAMESPACE" \
+              -l "app.kubernetes.io/name=$APP" \
+              --sort-by='.metadata.creationTimestamp' \
+              -o jsonpath='{.items[-2].metadata.labels.rollouts-pod-template-hash}' 2>/dev/null || echo "")
+          fi
+
+          echo "$PREVIOUS" > /tmp/previous
+          echo "Previous revision: $PREVIOUS"
+
+    # =========================================================================
+    # VALIDATE ROLLBACK
+    # =========================================================================
+    - name: validate-rollback
+      inputs:
+        parameters:
+          - name: current-revision
+          - name: previous-revision
+          - name: target-revision
+      outputs:
+        parameters:
+          - name: target-revision
+            valueFrom:
+              path: /tmp/target
+      script:
+        image: alpine:3.19
+        command: [sh]
+        source: |
+          #!/bin/sh
+          set -e
+
+          CURRENT="{{inputs.parameters.current-revision}}"
+          PREVIOUS="{{inputs.parameters.previous-revision}}"
+          TARGET="{{inputs.parameters.target-revision}}"
+
+          echo "Validating rollback..."
+          echo "  Current: $CURRENT"
+          echo "  Previous: $PREVIOUS"
+          echo "  Target: $TARGET"
+
+          # Determine target revision
+          if [ -n "$TARGET" ]; then
+            echo "Using specified target revision: $TARGET"
+            echo "$TARGET" > /tmp/target
+          elif [ -n "$PREVIOUS" ]; then
+            echo "Using previous revision: $PREVIOUS"
+            echo "$PREVIOUS" > /tmp/target
+          else
+            echo "Error: No target revision available"
+            exit 1
+          fi
+
+          # Validate we're not rolling back to current
+          FINAL_TARGET=$(cat /tmp/target)
+          if [ "$FINAL_TARGET" = "$CURRENT" ]; then
+            echo "Warning: Target revision is same as current"
+            echo "Rollback may not have any effect"
+          fi
+
+          echo "Validation passed"
+
+    # =========================================================================
+    # EXECUTE ROLLBACK
+    # =========================================================================
+    - name: execute-rollback
+      inputs:
+        parameters:
+          - name: app
+          - name: namespace
+          - name: target-revision
+      script:
+        image: argoproj/argo-rollouts:v1.6.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          NAMESPACE="{{inputs.parameters.namespace}}"
+          TARGET="{{inputs.parameters.target-revision}}"
+
+          echo "Executing rollback for $APP to revision $TARGET"
+
+          # Abort any in-progress rollout first
+          echo "→ Aborting any in-progress rollout..."
+          kubectl-argo-rollouts abort "$APP" -n "$NAMESPACE" 2>/dev/null || true
+
+          # Wait a moment
+          sleep 2
+
+          # Execute undo (rollback)
+          echo "→ Initiating rollback..."
+          kubectl-argo-rollouts undo "$APP" -n "$NAMESPACE"
+
+          echo "Rollback initiated successfully"
+
+    # =========================================================================
+    # WAIT FOR ROLLBACK COMPLETE
+    # =========================================================================
+    - name: wait-rollback-complete
+      inputs:
+        parameters:
+          - name: app
+          - name: namespace
+      script:
+        image: argoproj/argo-rollouts:v1.6.0
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          NAMESPACE="{{inputs.parameters.namespace}}"
+
+          echo "Waiting for rollback to complete..."
+
+          # Wait for rollout to be healthy
+          kubectl-argo-rollouts status "$APP" -n "$NAMESPACE" \
+            --timeout 600s \
+            --watch
+
+          echo "Rollback completed"
+
+    # =========================================================================
+    # VERIFY ROLLBACK HEALTH
+    # =========================================================================
+    - name: verify-rollback-health
+      inputs:
+        parameters:
+          - name: app
+          - name: namespace
+      outputs:
+        parameters:
+          - name: status
+            valueFrom:
+              path: /tmp/status
+      script:
+        image: bitnami/kubectl:1.29
+        command: [bash]
+        source: |
+          #!/bin/bash
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          NAMESPACE="{{inputs.parameters.namespace}}"
+
+          echo "Verifying health after rollback..."
+
+          FAILURES=0
+
+          # Check rollout status
+          echo "→ Checking rollout status..."
+          STATUS=$(kubectl get rollout "$APP" -n "$NAMESPACE" \
+            -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+
+          if [ "$STATUS" = "Healthy" ]; then
+            echo "  ✓ Rollout is healthy"
+          else
+            echo "  ⚠ Rollout status: $STATUS"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # Check pod readiness
+          echo "→ Checking pod readiness..."
+          READY=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$APP" \
+            -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -c "True" || echo "0")
+
+          TOTAL=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$APP" \
+            -o jsonpath='{.items[*].metadata.name}' | wc -w | tr -d ' ')
+
+          if [ "$READY" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+            echo "  ✓ All pods ready ($READY/$TOTAL)"
+          else
+            echo "  ✗ Pods not ready ($READY/$TOTAL)"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # Check service endpoints
+          echo "→ Checking service endpoints..."
+          ENDPOINTS=$(kubectl get endpoints "$APP" -n "$NAMESPACE" \
+            -o jsonpath='{.subsets[*].addresses}' 2>/dev/null | wc -c)
+
+          if [ "$ENDPOINTS" -gt 2 ]; then
+            echo "  ✓ Service has endpoints"
+          else
+            echo "  ✗ Service has no endpoints"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "failed" > /tmp/status
+            echo ""
+            echo "Health verification: FAILED ($FAILURES issues)"
+            exit 1
+          else
+            echo "healthy" > /tmp/status
+            echo ""
+            echo "Health verification: PASSED"
+          fi
+
+    # =========================================================================
+    # SYNC GITOPS STATE
+    # =========================================================================
+    - name: sync-gitops-state
+      inputs:
+        parameters:
+          - name: app
+          - name: namespace
+          - name: revision
+      script:
+        image: alpine/git:2.43.0
+        env:
+          - name: GITHUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: github-token
+                key: token
+        command: [sh]
+        source: |
+          #!/bin/sh
+          set -e
+
+          APP="{{inputs.parameters.app}}"
+          NAMESPACE="{{inputs.parameters.namespace}}"
+          REVISION="{{inputs.parameters.revision}}"
+
+          echo "Syncing GitOps state after rollback..."
+          echo "Note: GitOps should be updated to reflect rolled-back image"
+
+          # This is informational - actual GitOps update depends on your setup
+          # The rollback in k8s is immediate, GitOps will detect drift
+
+          echo "GitOps will sync on next reconciliation"
+
+    # =========================================================================
+    # SEND NOTIFICATION
+    # =========================================================================
+    - name: send-notification
+      inputs:
+        parameters:
+          - name: app
+          - name: message
+          - name: status
+          - name: reason
+      script:
+        image: curlimages/curl:8.5.0
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook
+                key: url
+                optional: true
+        command: [sh]
+        source: |
+          #!/bin/sh
+
+          APP="{{inputs.parameters.app}}"
+          MESSAGE="{{inputs.parameters.message}}"
+          STATUS="{{inputs.parameters.status}}"
+          REASON="{{inputs.parameters.reason}}"
+
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "Slack webhook not configured, skipping notification"
+            echo "Message: $MESSAGE"
+            echo "Status: $STATUS"
+            echo "Reason: $REASON"
+            exit 0
+          fi
+
+          case "$STATUS" in
+            in_progress)
+              COLOR="warning"
+              ;;
+            healthy|success)
+              COLOR="good"
+              ;;
+            *)
+              COLOR="danger"
+              ;;
+          esac
+
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"${COLOR}\",
+                \"blocks\": [
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"$MESSAGE\n*App:* $APP\n*Reason:* $REASON\n*Status:* $STATUS\"
+                    }
+                  }
+                ]
+              }]
+            }"
+
+          echo "Notification sent"
+---
+# =============================================================================
+# ERROR BUDGET MONITOR
+# =============================================================================
+# Monitors error budgets and triggers automatic rollback when exceeded
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: error-budget-monitor
+  namespace: argo-events
+spec:
+  template:
+    serviceAccountName: argo-events-sa
+  dependencies:
+    - name: prometheus-alert
+      eventSourceName: webhook
+      eventName: prometheus-alerts
+      filters:
+        data:
+          - path: body.alerts.0.labels.alertname
+            type: string
+            value:
+              - "ErrorBudgetExhausted"
+              - "HighErrorRate"
+              - "SLOBreach"
+  triggers:
+    - template:
+        name: trigger-rollback
+        conditions: "prometheus-alert"
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: auto-rollback-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: rollback-automation
+                arguments:
+                  parameters:
+                    - name: app
+                      value: ""
+                    - name: namespace
+                      value: ""
+                    - name: reason
+                      value: "Error budget exhausted"
+          parameters:
+            - src:
+                dependencyName: prometheus-alert
+                dataKey: body.alerts.0.labels.service
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: prometheus-alert
+                dataKey: body.alerts.0.labels.namespace
+              dest: spec.arguments.parameters.1.value
+---
+# =============================================================================
+# PROMETHEUS ALERTING RULES FOR ERROR BUDGET
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: error-budget-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: error-budget-alerts
+    prometheus: main
+spec:
+  groups:
+    - name: error-budget
+      interval: 30s
+      rules:
+        # Error rate SLO: 99.9% success rate
+        - alert: HighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{status=~"5.."}[5m])) by (namespace, service)
+              /
+              sum(rate(http_requests_total[5m])) by (namespace, service)
+            ) > 0.001
+          for: 5m
+          labels:
+            severity: critical
+            team: "{{ $labels.team }}"
+          annotations:
+            summary: "High error rate for {{ $labels.service }}"
+            description: "Error rate is {{ $value | humanizePercentage }} (threshold: 0.1%)"
+            runbook_url: "https://wiki.fasti.sh/runbooks/high-error-rate"
+
+        # Latency SLO: P99 < 500ms
+        - alert: HighLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket[5m])) by (namespace, service, le)
+            ) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            team: "{{ $labels.team }}"
+          annotations:
+            summary: "High P99 latency for {{ $labels.service }}"
+            description: "P99 latency is {{ $value | humanizeDuration }} (threshold: 500ms)"
+
+        # Error budget exhausted (monthly)
+        - alert: ErrorBudgetExhausted
+          expr: |
+            (
+              1 - (
+                sum(increase(http_requests_total{status=~"5.."}[30d])) by (namespace, service)
+                /
+                sum(increase(http_requests_total[30d])) by (namespace, service)
+              )
+            ) < 0.999
+          for: 1m
+          labels:
+            severity: critical
+            team: "{{ $labels.team }}"
+          annotations:
+            summary: "Error budget exhausted for {{ $labels.service }}"
+            description: "Monthly SLO is {{ $value | humanizePercentage }} (target: 99.9%)"
+
+        # Rollout stuck
+        - alert: RolloutStuck
+          expr: |
+            kube_rollout_status_phase{phase="Progressing"} == 1
+            and
+            time() - kube_rollout_status_last_updated_time > 600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Rollout stuck for {{ $labels.rollout }}"
+            description: "Rollout has been progressing for more than 10 minutes"

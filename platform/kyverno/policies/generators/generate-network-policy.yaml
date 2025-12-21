@@ -1,0 +1,83 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-default-network-policy
+  annotations:
+    policies.kyverno.io/title: Generate Default Network Policy
+    policies.kyverno.io/category: Network Security
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Namespace
+    policies.kyverno.io/description: >-
+      Automatically generates a default-deny NetworkPolicy for team namespaces.
+      This ensures all ingress traffic is denied by default and must be explicitly allowed.
+spec:
+  rules:
+    - name: generate-default-deny-ingress
+      match:
+        any:
+          - resources:
+              kinds:
+                - Namespace
+              names:
+                - "team-*"
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - argocd
+                - argo
+      generate:
+        synchronize: true
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: default-deny-ingress
+        namespace: "{{request.object.metadata.name}}"
+        data:
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-allow-dns-egress
+  annotations:
+    policies.kyverno.io/title: Generate DNS Egress Policy
+    policies.kyverno.io/category: Network Security
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/subject: Namespace
+    policies.kyverno.io/description: >-
+      Automatically generates a NetworkPolicy allowing DNS egress for team namespaces.
+spec:
+  rules:
+    - name: generate-allow-dns
+      match:
+        any:
+          - resources:
+              kinds:
+                - Namespace
+              names:
+                - "team-*"
+      generate:
+        synchronize: true
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: allow-dns-egress
+        namespace: "{{request.object.metadata.name}}"
+        data:
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Egress
+            egress:
+              - to:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: kube-system
+                ports:
+                  - protocol: UDP
+                    port: 53
+                  - protocol: TCP
+                    port: 53

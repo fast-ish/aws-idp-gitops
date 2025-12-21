@@ -1,0 +1,196 @@
+# =============================================================================
+# VELERO - BACKUP & DISASTER RECOVERY
+# =============================================================================
+# Kubernetes backup solution with AWS S3 backend and EBS snapshots.
+# =============================================================================
+
+# Disable CRD upgrade hook (fresh install, not needed)
+upgradeCRDs: false
+
+image:
+  repository: velero/velero
+  tag: v1.13.0
+  pullPolicy: IfNotPresent
+
+# AWS Plugin for S3 and EBS
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.9.0
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+      - mountPath: /target
+        name: plugins
+
+# Service Account with IRSA
+serviceAccount:
+  server:
+    create: true
+    name: velero
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::351619759866:role/velero-backup
+
+# Velero Configuration
+configuration:
+  # Backup Storage Location (S3)
+  backupStorageLocation:
+    - name: default
+      provider: aws
+      bucket: fasti-sh-velero-backups
+      prefix: cluster-backups
+      config:
+        region: us-west-2
+        s3ForcePathStyle: "false"
+      accessMode: ReadWrite
+      default: true
+
+  # Volume Snapshot Location (EBS)
+  volumeSnapshotLocation:
+    - name: default
+      provider: aws
+      config:
+        region: us-west-2
+
+  # Default settings
+  defaultBackupStorageLocation: default
+  defaultVolumeSnapshotLocations: aws:default
+  defaultSnapshotMoveData: true
+
+  # Garbage collection
+  garbageCollectionFrequency: 1h
+
+  # Features
+  features: EnableCSI
+
+# Resources
+resources:
+  requests:
+    cpu: 500m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+# Node Selector
+nodeSelector:
+  kubernetes.io/os: linux
+
+# Tolerations for system nodes
+tolerations:
+  - key: CriticalAddonsOnly
+    operator: Exists
+
+# Pod Security
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  fsGroup: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+# Prometheus Metrics
+metrics:
+  enabled: true
+  scrapeInterval: 30s
+  serviceMonitor:
+    enabled: true
+    namespace: velero
+    additionalLabels:
+      release: kube-prometheus-stack
+
+# Backup Schedules
+schedules:
+  # Daily full cluster backup
+  daily-cluster-backup:
+    disabled: false
+    schedule: "0 3 * * *"  # 3 AM UTC daily
+    useOwnerReferencesInBackup: false
+    template:
+      ttl: 720h  # 30 days retention
+      includedNamespaces:
+        - "*"
+      excludedNamespaces:
+        - kube-system
+        - kube-public
+        - kube-node-lease
+        - velero
+      excludedResources:
+        - events
+        - events.events.k8s.io
+      includeClusterResources: true
+      snapshotVolumes: true
+      storageLocation: default
+      volumeSnapshotLocations:
+        - default
+      metadata:
+        labels:
+          backup-type: daily
+          fasti.sh/backup: scheduled
+
+  # Hourly backup for critical namespaces
+  hourly-critical-backup:
+    disabled: false
+    schedule: "0 * * * *"  # Every hour
+    useOwnerReferencesInBackup: false
+    template:
+      ttl: 168h  # 7 days retention
+      includedNamespaces:
+        - "prod-*"
+        - "team-*"
+      labelSelector:
+        matchLabels:
+          fasti.sh/backup: critical
+      includeClusterResources: false
+      snapshotVolumes: true
+      storageLocation: default
+      volumeSnapshotLocations:
+        - default
+      metadata:
+        labels:
+          backup-type: hourly
+          fasti.sh/backup: critical
+
+  # Weekly full backup with extended retention
+  weekly-full-backup:
+    disabled: false
+    schedule: "0 2 * * 0"  # 2 AM UTC every Sunday
+    useOwnerReferencesInBackup: false
+    template:
+      ttl: 2160h  # 90 days retention
+      includedNamespaces:
+        - "*"
+      excludedNamespaces:
+        - kube-system
+        - kube-public
+        - kube-node-lease
+        - velero
+      includeClusterResources: true
+      snapshotVolumes: true
+      storageLocation: default
+      volumeSnapshotLocations:
+        - default
+      metadata:
+        labels:
+          backup-type: weekly
+          fasti.sh/backup: full
+
+# Deploy node agent for file-level backups
+deployNodeAgent: true
+
+nodeAgent:
+  podVolumePath: /var/lib/kubelet/pods
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Credentials (using IRSA, so not needed)
+credentials:
+  useSecret: false

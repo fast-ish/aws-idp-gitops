@@ -1,0 +1,80 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: team-namespaces
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        revision: HEAD
+        files:
+          - path: "teams/*/team.yaml"
+  template:
+    metadata:
+      name: "team-{{.team}}-namespace"
+      labels:
+        app.kubernetes.io/name: "{{.team}}"
+        app.kubernetes.io/component: namespace
+        app.kubernetes.io/part-of: idp
+        team: "{{.team}}"
+    spec:
+      project: platform
+      source:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        targetRevision: HEAD
+        path: platform/team-resources
+        helm:
+          valuesObject:
+            team:
+              name: "{{.team}}"
+              namespace: "{{.namespace}}"
+              description: "{{.description}}"
+            owner:
+              name: "{{.owner.name}}"
+              email: "{{.owner.email}}"
+              slack: "{{.owner.slack}}"
+            resourceQuota:
+              requests:
+                cpu: "{{.resourceQuota.requests.cpu}}"
+                memory: "{{.resourceQuota.requests.memory}}"
+              limits:
+                cpu: "{{.resourceQuota.limits.cpu}}"
+                memory: "{{.resourceQuota.limits.memory}}"
+              pods: "{{.resourceQuota.pods}}"
+              services: "{{.resourceQuota.services}}"
+              configmaps: "{{.resourceQuota.configmaps}}"
+              secrets: "{{.resourceQuota.secrets}}"
+              persistentvolumeclaims: "{{.resourceQuota.persistentvolumeclaims}}"
+            limitRange:
+              default:
+                cpu: "{{.limitRange.default.cpu}}"
+                memory: "{{.limitRange.default.memory}}"
+              defaultRequest:
+                cpu: "{{.limitRange.defaultRequest.cpu}}"
+                memory: "{{.limitRange.defaultRequest.memory}}"
+              max:
+                cpu: "{{.limitRange.max.cpu}}"
+                memory: "{{.limitRange.max.memory}}"
+            networkPolicy:
+              allowIngress: "{{.networkPolicy.allowIngress}}"
+              allowEgress: "{{.networkPolicy.allowEgress}}"
+              allowFromNamespacesRaw: "{{- range $i, $ns := .networkPolicy.allowFromNamespaces}}{{if $i}},{{end}}{{$ns}}{{- end}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{.namespace}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

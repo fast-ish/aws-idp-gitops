@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - block-latest-tag.yaml
+  - require-non-root.yaml
+  - require-readonly-root.yaml
+  - require-seccomp.yaml
+  - restrict-registries.yaml
+  - verify-image-signature.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: kyverno
+  app.kubernetes.io/component: security-policies

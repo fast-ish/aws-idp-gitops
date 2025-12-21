@@ -1,0 +1,110 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+  annotations:
+    policies.kyverno.io/title: Verify Image Signatures
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: |
+      Verify that container images from the organization ECR
+      are signed with Cosign using the platform KMS key.
+      This ensures supply chain integrity.
+spec:
+  # Start in Audit mode, switch to Enforce after validation
+  validationFailureAction: Audit
+  background: true
+  webhookTimeoutSeconds: 30
+
+  rules:
+    - name: verify-ecr-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - "team-*"
+      verifyImages:
+        # Verify images from our ECR
+        - imageReferences:
+            - "351619759866.dkr.ecr.*.amazonaws.com/*"
+          attestors:
+            - entries:
+                - keys:
+                    # AWS KMS key for Cosign signatures
+                    # This should be created in aws-idp-infra
+                    kms: "awskms:///arn:aws:kms:us-west-2:351619759866:alias/idp-cosign"
+          # Verify SBOM attestation exists
+          attestations:
+            - predicateType: https://spdx.dev/Document
+              conditions:
+                - all:
+                    - key: "{{ creationInfo.created }}"
+                      operator: NotEquals
+                      value: ""
+
+    - name: verify-external-images-have-digest
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - "team-*"
+      exclude:
+        any:
+          - resources:
+              selector:
+                matchLabels:
+                  # Skip verification for specific workloads
+                  fasti.sh/skip-image-verify: "true"
+      validate:
+        message: "External images must use digest references (@sha256:...), not tags"
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                all:
+                  # Only check non-ECR images
+                  - key: "{{ element.image }}"
+                    operator: NotEquals
+                    value: "351619759866.dkr.ecr.*"
+                  # Deny if using tag instead of digest
+                  - key: "{{ element.image }}"
+                    operator: NotEquals
+                    value: "*@sha256:*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: mutate-image-digest
+  annotations:
+    policies.kyverno.io/title: Mutate Images to Use Digest
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/description: |
+      Automatically resolve image tags to digests for immutability.
+      This prevents image tag mutation attacks.
+spec:
+  validationFailureAction: Audit
+  background: false
+
+  rules:
+    - name: resolve-tag-to-digest
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - "team-*"
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    # This uses Kyverno's image verification to resolve to digest
+                    # Requires imageRegistry feature
+                    image: "{{ images.containers.\"{{element.name}}\".resolvedImage }}"

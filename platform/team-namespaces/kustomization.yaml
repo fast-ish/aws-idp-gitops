@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Team namespaces and Argo Workflows infrastructure
+# These can be deployed via ArgoCD Application or CDK Helm chart
+
+resources:
+  # Team namespaces with Argo Workflows RBAC
+  - team-namespaces.yaml
+  # Argo Workflows database credentials (from Backstage RDS)
+  - argo-workflows-db-secret.yaml

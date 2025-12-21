@@ -1,0 +1,236 @@
+# =============================================================================
+# SLO BURN RATE ALERTS - MULTI-WINDOW
+# =============================================================================
+# Implements Google SRE multi-window, multi-burn-rate alerting strategy.
+# Alerts at different speeds based on severity of budget burn.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slo-burn-rate-multiwindow
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: slo-burn-rate
+    app.kubernetes.io/component: alerting
+    app.kubernetes.io/part-of: observability
+    prometheus: main
+spec:
+  groups:
+    # =========================================================================
+    # RECORDING RULES - Error Budget Burn Rates
+    # =========================================================================
+    - name: slo.recording.burnrate
+      interval: 30s
+      rules:
+        # Error rate SLI (99.9% availability = 0.001 error budget)
+        - record: service:http_error_ratio:rate5m
+          expr: |
+            sum by (namespace, service) (
+              rate(http_requests_total{status=~"5.."}[5m])
+            )
+            /
+            sum by (namespace, service) (
+              rate(http_requests_total[5m])
+            )
+
+        # Success ratio (for SLO calculation)
+        - record: service:http_success_ratio:rate5m
+          expr: |
+            1 - service:http_error_ratio:rate5m
+
+        # Burn rates at different windows (for 99.9% SLO)
+        - record: service:error_budget:burn_rate_1h
+          expr: |
+            service:http_error_ratio:rate5m / 0.001
+
+        - record: service:error_budget:burn_rate_6h
+          expr: |
+            (
+              1 - avg_over_time(service:http_success_ratio:rate5m[6h])
+            ) / 0.001
+
+        - record: service:error_budget:burn_rate_1d
+          expr: |
+            (
+              1 - avg_over_time(service:http_success_ratio:rate5m[1d])
+            ) / 0.001
+
+        - record: service:error_budget:burn_rate_3d
+          expr: |
+            (
+              1 - avg_over_time(service:http_success_ratio:rate5m[3d])
+            ) / 0.001
+
+        # Latency SLI (95% of requests under 500ms)
+        - record: service:http_latency_sli:rate5m
+          expr: |
+            sum by (namespace, service) (
+              rate(http_request_duration_seconds_bucket{le="0.5"}[5m])
+            )
+            /
+            sum by (namespace, service) (
+              rate(http_request_duration_seconds_count[5m])
+            )
+
+        # Error budget remaining (monthly)
+        - record: service:error_budget:remaining_ratio
+          expr: |
+            1 - (
+              sum by (namespace, service) (
+                increase(http_requests_total{status=~"5.."}[30d])
+              )
+              /
+              (
+                sum by (namespace, service) (
+                  increase(http_requests_total[30d])
+                ) * 0.001
+              )
+            )
+
+    # =========================================================================
+    # MULTI-WINDOW BURN RATE ALERTS
+    # =========================================================================
+    - name: slo.alerts.burnrate
+      interval: 30s
+      rules:
+        # =================================================================
+        # CRITICAL: 2% budget in 1 hour (14.4x burn rate)
+        # Page immediately - major incident
+        # Short window: 5m, Long window: 1h
+        # =================================================================
+        - alert: SLOBurnRateCritical
+          expr: |
+            (
+              service:error_budget:burn_rate_1h > 14.4
+              and
+              service:http_error_ratio:rate5m / 0.001 > 14.4
+            )
+            and
+            sum by (namespace, service) (rate(http_requests_total[5m])) > 1
+          for: 2m
+          labels:
+            severity: critical
+            category: slo
+            window: fast
+            page: "true"
+          annotations:
+            summary: "CRITICAL: {{ $labels.service }} burning error budget at 14.4x rate"
+            description: >-
+              Service {{ $labels.service }} in {{ $labels.namespace }} is burning
+              error budget extremely fast. At this rate, monthly budget will be
+              exhausted in less than 2 hours.
+            action: "PAGE ON-CALL IMMEDIATELY - Major incident in progress"
+            runbook_url: "https://wiki.internal/runbooks/slo-burn-critical"
+            dashboard_url: "https://grafana.internal/d/slo/{{ $labels.service }}"
+
+        # =================================================================
+        # HIGH: 5% budget in 6 hours (6x burn rate)
+        # Create ticket - needs investigation today
+        # Short window: 30m, Long window: 6h
+        # =================================================================
+        - alert: SLOBurnRateHigh
+          expr: |
+            (
+              service:error_budget:burn_rate_6h > 6
+              and
+              avg_over_time(service:error_budget:burn_rate_1h[30m]) > 6
+            )
+            and
+            sum by (namespace, service) (rate(http_requests_total[5m])) > 1
+          for: 15m
+          labels:
+            severity: warning
+            category: slo
+            window: medium
+          annotations:
+            summary: "HIGH: {{ $labels.service }} burning error budget at 6x rate"
+            description: >-
+              Service {{ $labels.service }} in {{ $labels.namespace }} is burning
+              error budget at an elevated rate. At this rate, monthly budget will
+              be exhausted in ~5 days.
+            action: "Create ticket for investigation - resolve today"
+            runbook_url: "https://wiki.internal/runbooks/slo-burn-high"
+
+        # =================================================================
+        # ELEVATED: 10% budget in 3 days (1x burn rate)
+        # Informational - track for trending
+        # Short window: 1d, Long window: 3d
+        # =================================================================
+        - alert: SLOBurnRateElevated
+          expr: |
+            (
+              service:error_budget:burn_rate_3d > 1
+              and
+              service:error_budget:burn_rate_1d > 1
+            )
+            and
+            sum by (namespace, service) (rate(http_requests_total[5m])) > 0.5
+          for: 1h
+          labels:
+            severity: info
+            category: slo
+            window: slow
+          annotations:
+            summary: "ELEVATED: {{ $labels.service }} on track to exhaust error budget"
+            description: >-
+              Service {{ $labels.service }} in {{ $labels.namespace }} is on track
+              to exhaust monthly error budget before end of period.
+            action: "Review for systemic issues - plan remediation"
+
+        # =================================================================
+        # LATENCY SLO ALERTS
+        # =================================================================
+        - alert: SLOLatencyBurnRateHigh
+          expr: |
+            (
+              (1 - service:http_latency_sli:rate5m) / 0.05 > 6
+            )
+            and
+            sum by (namespace, service) (rate(http_requests_total[5m])) > 1
+          for: 15m
+          labels:
+            severity: warning
+            category: slo
+            signal: latency
+          annotations:
+            summary: "Latency SLO burn rate high for {{ $labels.service }}"
+            description: >-
+              Too many requests exceeding latency threshold (500ms).
+              Current: {{ $value | humanizePercentage }} of requests are slow.
+            action: "Investigate latency regression"
+
+        # =================================================================
+        # ERROR BUDGET EXHAUSTED
+        # =================================================================
+        - alert: SLOErrorBudgetExhausted
+          expr: |
+            service:error_budget:remaining_ratio < 0
+          for: 5m
+          labels:
+            severity: critical
+            category: slo
+          annotations:
+            summary: "Error budget exhausted for {{ $labels.service }}"
+            description: >-
+              Service {{ $labels.service }} has exhausted its monthly error budget.
+              Feature releases should be frozen until budget recovers.
+            action: "Freeze deployments - focus on reliability"
+
+        # =================================================================
+        # ERROR BUDGET LOW WARNING
+        # =================================================================
+        - alert: SLOErrorBudgetLow
+          expr: |
+            service:error_budget:remaining_ratio < 0.25
+            and
+            service:error_budget:remaining_ratio > 0
+          for: 1h
+          labels:
+            severity: warning
+            category: slo
+          annotations:
+            summary: "Error budget running low for {{ $labels.service }}"
+            description: >-
+              Service {{ $labels.service }} has less than 25% of monthly error
+              budget remaining. Consider reducing deployment velocity.
+            action: "Review error sources - consider deployment freeze"

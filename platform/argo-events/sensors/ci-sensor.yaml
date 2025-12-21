@@ -1,0 +1,192 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: ci-sensor
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: ci-sensor
+    app.kubernetes.io/component: sensor
+    app.kubernetes.io/part-of: argo-events
+spec:
+  eventBusName: default
+  template:
+    serviceAccountName: argo-events-sensor
+    container:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+
+  dependencies:
+    - name: github-push
+      eventSourceName: github-webhook
+      eventName: push
+      filters:
+        data:
+          - path: body.ref
+            type: string
+            value:
+              - "refs/heads/main"
+              - "refs/heads/develop"
+
+    - name: github-pr
+      eventSourceName: github-webhook
+      eventName: pull-request
+      filters:
+        data:
+          - path: body.action
+            type: string
+            value:
+              - "opened"
+              - "synchronize"
+
+  triggers:
+    # Trigger CI workflow on push to main/develop
+    - template:
+        name: ci-workflow-trigger
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: ci-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: ci-cd-pipeline
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: image-name
+                    - name: ecr-registry
+                    - name: argocd-app-name
+                    - name: gitops-path
+          parameters:
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.after
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "{{ .Input.body.repository.name }}"
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "351619759866.dkr.ecr.us-west-2.amazonaws.com"
+              dest: spec.arguments.parameters.3.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "{{ .Input.body.repository.name }}"
+              dest: spec.arguments.parameters.4.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "teams/backend/apps/{{ .Input.body.repository.name }}"
+              dest: spec.arguments.parameters.5.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+      conditions: github-push
+
+    # Trigger CI for PRs (no deploy)
+    - template:
+        name: pr-ci-trigger
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: pr-ci-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: ci-cd-pipeline
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: image-name
+                    - name: ecr-registry
+                    - name: deploy-enabled
+                      value: "false"
+                    - name: run-tests
+                      value: "true"
+          parameters:
+            - src:
+                dependencyName: github-pr
+                dataKey: body.pull_request.head.repo.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-pr
+                dataKey: body.pull_request.head.sha
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-pr
+                dataTemplate: "{{ .Input.body.repository.name }}-pr-{{ .Input.body.number }}"
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-pr
+                dataTemplate: "351619759866.dkr.ecr.us-west-2.amazonaws.com"
+              dest: spec.arguments.parameters.3.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+      conditions: github-pr
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argo-events-sensor
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: argo-events-sensor
+    app.kubernetes.io/component: service-account
+    app.kubernetes.io/part-of: argo-events
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argo-events-sensor
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: argo-events-sensor
+    app.kubernetes.io/component: role
+    app.kubernetes.io/part-of: argo-events
+rules:
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - workflows
+    verbs:
+      - create
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-events-sensor
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: argo-events-sensor
+    app.kubernetes.io/component: rolebinding
+    app.kubernetes.io/part-of: argo-events
+subjects:
+  - kind: ServiceAccount
+    name: argo-events-sensor
+    namespace: argo-events
+roleRef:
+  kind: Role
+  name: argo-events-sensor
+  apiGroup: rbac.authorization.k8s.io

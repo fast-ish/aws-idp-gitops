@@ -1,0 +1,33 @@
+controller:
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: argo-rollouts
+
+dashboard:
+  enabled: true
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# Notifications for rollout events
+# Disabled due to complexity - can be enabled later via separate ConfigMap
+notifications:
+  enabled: false

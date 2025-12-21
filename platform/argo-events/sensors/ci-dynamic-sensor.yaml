@@ -1,0 +1,438 @@
+# =============================================================================
+# DYNAMIC CI SENSOR
+# =============================================================================
+# Triggers the appropriate CI workflow based on the repository's .argo/ci.yaml
+# configuration file. This allows each repository to specify its build settings.
+#
+# Expected .argo/ci.yaml format:
+#   language: java|python|node|go|ruby
+#   team: <team-name>
+#   config:
+#     java-version: "21"          # Language-specific config
+#     maven-goals: "clean verify"
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: ci-dynamic-sensor
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: ci-dynamic-sensor
+    app.kubernetes.io/component: sensor
+    app.kubernetes.io/part-of: argo-events
+spec:
+  eventBusName: default
+  template:
+    serviceAccountName: argo-events-sensor
+    container:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+
+  dependencies:
+    - name: github-push
+      eventSourceName: github-webhook
+      eventName: push
+      filters:
+        data:
+          - path: body.ref
+            type: string
+            value:
+              - "refs/heads/main"
+              - "refs/heads/develop"
+        exprs:
+          # Only trigger if .argo/ci.yaml exists (modified files check)
+          - expr: "true"
+            fields:
+              - name: commits
+                path: body.commits
+
+    - name: github-pr
+      eventSourceName: github-webhook
+      eventName: pull-request
+      filters:
+        data:
+          - path: body.action
+            type: string
+            value:
+              - "opened"
+              - "synchronize"
+              - "reopened"
+
+  triggers:
+    # ==========================================================================
+    # JAVA CI TRIGGER
+    # ==========================================================================
+    - template:
+        name: java-ci-trigger
+        conditions: github-push
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: ci-java-
+                namespace: argo
+                labels:
+                  fasti.sh/language: java
+                  fasti.sh/trigger: push
+              spec:
+                workflowTemplateRef:
+                  name: ci-java
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: app-name
+                    - name: team
+          parameters:
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.after
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.name
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "{{ .Input.body.repository.owner.login | default \"backend\" }}"
+              dest: spec.arguments.parameters.3.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+
+    # ==========================================================================
+    # PYTHON CI TRIGGER
+    # ==========================================================================
+    - template:
+        name: python-ci-trigger
+        conditions: github-push
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: ci-python-
+                namespace: argo
+                labels:
+                  fasti.sh/language: python
+                  fasti.sh/trigger: push
+              spec:
+                workflowTemplateRef:
+                  name: ci-python
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: app-name
+                    - name: team
+          parameters:
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.after
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.name
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "{{ .Input.body.repository.owner.login | default \"backend\" }}"
+              dest: spec.arguments.parameters.3.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+
+    # ==========================================================================
+    # NODE CI TRIGGER
+    # ==========================================================================
+    - template:
+        name: node-ci-trigger
+        conditions: github-push
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: ci-node-
+                namespace: argo
+                labels:
+                  fasti.sh/language: node
+                  fasti.sh/trigger: push
+              spec:
+                workflowTemplateRef:
+                  name: ci-node
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: app-name
+                    - name: team
+          parameters:
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.after
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.name
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "{{ .Input.body.repository.owner.login | default \"frontend\" }}"
+              dest: spec.arguments.parameters.3.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+
+    # ==========================================================================
+    # GO CI TRIGGER
+    # ==========================================================================
+    - template:
+        name: go-ci-trigger
+        conditions: github-push
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: ci-go-
+                namespace: argo
+                labels:
+                  fasti.sh/language: go
+                  fasti.sh/trigger: push
+              spec:
+                workflowTemplateRef:
+                  name: ci-go
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: app-name
+                    - name: team
+          parameters:
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.after
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.name
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "{{ .Input.body.repository.owner.login | default \"platform\" }}"
+              dest: spec.arguments.parameters.3.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+
+    # ==========================================================================
+    # RUBY CI TRIGGER
+    # ==========================================================================
+    - template:
+        name: ruby-ci-trigger
+        conditions: github-push
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: ci-ruby-
+                namespace: argo
+                labels:
+                  fasti.sh/language: ruby
+                  fasti.sh/trigger: push
+              spec:
+                workflowTemplateRef:
+                  name: ci-ruby
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: app-name
+                    - name: team
+          parameters:
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.after
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-push
+                dataKey: body.repository.name
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-push
+                dataTemplate: "{{ .Input.body.repository.owner.login | default \"backend\" }}"
+              dest: spec.arguments.parameters.3.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+
+    # ==========================================================================
+    # PR CI TRIGGERS (No Deploy)
+    # ==========================================================================
+    - template:
+        name: pr-ci-trigger
+        conditions: github-pr
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: pr-ci-
+                namespace: argo
+                labels:
+                  fasti.sh/trigger: pull-request
+              spec:
+                # Will be overridden by the detect-language step
+                workflowTemplateRef:
+                  name: ci-java
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: app-name
+                    - name: team
+                    - name: deploy-enabled
+                      value: "false"
+                    - name: skip-tests
+                      value: "false"
+          parameters:
+            - src:
+                dependencyName: github-pr
+                dataKey: body.pull_request.head.repo.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-pr
+                dataKey: body.pull_request.head.sha
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-pr
+                dataTemplate: "{{ .Input.body.repository.name }}-pr-{{ .Input.body.number }}"
+              dest: spec.arguments.parameters.2.value
+            - src:
+                dependencyName: github-pr
+                dataTemplate: "{{ .Input.body.repository.owner.login | default \"backend\" }}"
+              dest: spec.arguments.parameters.3.value
+      retryStrategy:
+        steps: 3
+        duration: 30s
+---
+# =============================================================================
+# SMART CI SENSOR
+# =============================================================================
+# Uses a dispatcher workflow that detects language from .argo/ci.yaml
+# and delegates to the appropriate language-specific workflow.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: ci-smart-sensor
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/name: ci-smart-sensor
+    app.kubernetes.io/component: sensor
+    app.kubernetes.io/part-of: argo-events
+  annotations:
+    description: |
+      Smart CI sensor that auto-detects language from .argo/ci.yaml
+      and triggers the appropriate workflow template.
+spec:
+  eventBusName: default
+  template:
+    serviceAccountName: argo-events-sensor
+    container:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+
+  dependencies:
+    - name: github-push-main
+      eventSourceName: github-webhook
+      eventName: push
+      filters:
+        data:
+          - path: body.ref
+            type: string
+            value:
+              - "refs/heads/main"
+
+  triggers:
+    - template:
+        name: smart-ci-trigger
+        conditions: github-push-main
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: ci-dispatch-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: ci-dispatcher
+                arguments:
+                  parameters:
+                    - name: repo-url
+                    - name: revision
+                    - name: app-name
+          parameters:
+            - src:
+                dependencyName: github-push-main
+                dataKey: body.repository.clone_url
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-push-main
+                dataKey: body.after
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-push-main
+                dataKey: body.repository.name
+              dest: spec.arguments.parameters.2.value
+      retryStrategy:
+        steps: 3
+        duration: 30s

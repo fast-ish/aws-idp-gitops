@@ -1,0 +1,200 @@
+# =============================================================================
+# DISASTER RECOVERY RUNBOOK
+# =============================================================================
+# Quick reference for disaster recovery procedures using Velero.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: disaster-recovery-runbook
+  namespace: velero
+  labels:
+    app.kubernetes.io/name: velero
+    app.kubernetes.io/component: documentation
+data:
+  runbook.md: |
+    # Disaster Recovery Runbook
+
+    ## Quick Reference
+
+    ### List Available Backups
+    ```bash
+    velero backup get
+    velero backup describe <backup-name> --details
+    ```
+
+    ### Restore Entire Cluster
+    ```bash
+    velero restore create --from-backup daily-cluster-backup-<timestamp>
+    ```
+
+    ### Restore Specific Namespace
+    ```bash
+    velero restore create --from-backup <backup-name> \
+      --include-namespaces <namespace>
+    ```
+
+    ### Restore to Different Namespace
+    ```bash
+    velero restore create --from-backup <backup-name> \
+      --namespace-mappings "original-ns:new-ns"
+    ```
+
+    ### Restore Specific Resources
+    ```bash
+    velero restore create --from-backup <backup-name> \
+      --include-resources deployments,services,configmaps
+    ```
+
+    ### Restore with Label Selector
+    ```bash
+    velero restore create --from-backup <backup-name> \
+      --selector "app=myapp"
+    ```
+
+    ---
+
+    ## Disaster Scenarios
+
+    ### Scenario 1: Namespace Accidentally Deleted
+
+    1. Identify the latest backup containing the namespace:
+       ```bash
+       velero backup get -l backup-type=hourly
+       ```
+
+    2. Create restore for the namespace:
+       ```bash
+       velero restore create ns-recovery-$(date +%s) \
+         --from-backup <backup-name> \
+         --include-namespaces <deleted-namespace>
+       ```
+
+    3. Monitor restore progress:
+       ```bash
+       velero restore describe ns-recovery-<id> --details
+       ```
+
+    ### Scenario 2: Application Data Corruption
+
+    1. Scale down the application:
+       ```bash
+       kubectl scale deployment <app> -n <namespace> --replicas=0
+       ```
+
+    2. Delete corrupted PVCs:
+       ```bash
+       kubectl delete pvc <pvc-name> -n <namespace>
+       ```
+
+    3. Restore from backup:
+       ```bash
+       velero restore create data-recovery-$(date +%s) \
+         --from-backup <backup-name> \
+         --include-namespaces <namespace> \
+         --include-resources persistentvolumeclaims,persistentvolumes
+       ```
+
+    4. Scale up the application:
+       ```bash
+       kubectl scale deployment <app> -n <namespace> --replicas=<original>
+       ```
+
+    ### Scenario 3: Full Cluster Recovery
+
+    1. Ensure new cluster has Velero installed with same configuration
+
+    2. Verify backup storage access:
+       ```bash
+       velero backup-location get
+       ```
+
+    3. Sync backups from storage:
+       ```bash
+       velero backup get  # Should show backups from S3
+       ```
+
+    4. Restore cluster resources first:
+       ```bash
+       velero restore create cluster-recovery-$(date +%s) \
+         --from-backup weekly-full-backup-<timestamp> \
+         --include-cluster-resources=true
+       ```
+
+    5. Restore namespace resources:
+       ```bash
+       velero restore create ns-recovery-$(date +%s) \
+         --from-backup weekly-full-backup-<timestamp> \
+         --exclude-cluster-resources=true
+       ```
+
+    ---
+
+    ## Verification Steps
+
+    After any restore:
+
+    1. Check restore status:
+       ```bash
+       velero restore get
+       velero restore describe <restore-name> --details
+       ```
+
+    2. Verify pods are running:
+       ```bash
+       kubectl get pods -n <namespace>
+       ```
+
+    3. Check application health:
+       ```bash
+       kubectl get deployments,statefulsets -n <namespace>
+       ```
+
+    4. Verify data integrity:
+       ```bash
+       # Application-specific verification
+       ```
+
+    ---
+
+    ## Emergency Contacts
+
+    - **Platform Team**: #platform-oncall
+    - **Escalation**: PagerDuty - Platform Critical
+    - **AWS Support**: Enterprise Support Case
+
+    ---
+
+    ## Backup Schedule Reference
+
+    | Schedule | Frequency | Retention | Namespaces |
+    |----------|-----------|-----------|------------|
+    | daily-cluster-backup | Daily 3 AM | 30 days | All |
+    | hourly-critical-backup | Hourly | 7 days | prod-*, team-* |
+    | weekly-full-backup | Sunday 2 AM | 90 days | All |
+
+    ---
+
+    ## Useful Commands
+
+    ```bash
+    # Check backup storage location
+    velero backup-location get
+
+    # Check snapshot location
+    velero snapshot-location get
+
+    # View backup logs
+    velero backup logs <backup-name>
+
+    # View restore logs
+    velero restore logs <restore-name>
+
+    # Delete old backups manually
+    velero backup delete <backup-name>
+
+    # Create ad-hoc backup
+    velero backup create manual-backup-$(date +%Y%m%d) \
+      --include-namespaces <namespace> \
+      --ttl 48h
+    ```

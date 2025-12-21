@@ -1,0 +1,389 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ci-ruby
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: ci-ruby
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+    fasti.sh/language: ruby
+  annotations:
+    description: |
+      CI pipeline for Ruby/Rails applications.
+      Supports bundler, RSpec, RuboCop, and ECR push.
+spec:
+  entrypoint: pipeline
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+  podGC:
+    strategy: OnWorkflowSuccess
+    deleteDelayDuration: 5m
+  onExit: notify
+
+  arguments:
+    parameters:
+      - name: repo-url
+        description: Git repository URL
+      - name: revision
+        default: main
+        description: Git revision (branch, tag, or commit SHA)
+      - name: app-name
+        description: Application name
+      - name: team
+        description: Team name (owner)
+      - name: ecr-registry
+        default: "351619759866.dkr.ecr.us-west-2.amazonaws.com"
+      - name: ruby-version
+        default: "3.3"
+      - name: skip-tests
+        default: "false"
+      - name: deploy-enabled
+        default: "true"
+
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+    - metadata:
+        name: bundle-cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+
+  templates:
+    - name: pipeline
+      dag:
+        tasks:
+          - name: clone
+            template: git-clone
+            arguments:
+              parameters:
+                - name: repo-url
+                  value: "{{workflow.parameters.repo-url}}"
+                - name: revision
+                  value: "{{workflow.parameters.revision}}"
+
+          - name: install
+            template: bundle-install
+            dependencies: [clone]
+            arguments:
+              parameters:
+                - name: ruby-version
+                  value: "{{workflow.parameters.ruby-version}}"
+
+          - name: lint
+            template: rubocop
+            dependencies: [install]
+            arguments:
+              parameters:
+                - name: ruby-version
+                  value: "{{workflow.parameters.ruby-version}}"
+
+          - name: test
+            template: rspec
+            when: "{{workflow.parameters.skip-tests}} != true"
+            dependencies: [install]
+            arguments:
+              parameters:
+                - name: ruby-version
+                  value: "{{workflow.parameters.ruby-version}}"
+
+          - name: build-image
+            template: kaniko-build
+            dependencies: [lint, test]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.ecr-registry}}/{{workflow.parameters.team}}/{{workflow.parameters.app-name}}"
+                - name: tag
+                  value: "{{workflow.parameters.revision}}"
+
+          - name: scan-image
+            template: trivy-scan
+            dependencies: [build-image]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.ecr-registry}}/{{workflow.parameters.team}}/{{workflow.parameters.app-name}}:{{workflow.parameters.revision}}"
+
+          - name: update-gitops
+            template: update-gitops-repo
+            when: "{{workflow.parameters.deploy-enabled}} == true"
+            dependencies: [scan-image]
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+                - name: team
+                  value: "{{workflow.parameters.team}}"
+                - name: image-tag
+                  value: "{{workflow.parameters.revision}}"
+
+    - name: git-clone
+      inputs:
+        parameters:
+          - name: repo-url
+          - name: revision
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Cloning {{inputs.parameters.repo-url}} at {{inputs.parameters.revision}}"
+            git clone --depth 1 --branch {{inputs.parameters.revision}} \
+              {{inputs.parameters.repo-url}} /work/src || \
+            git clone {{inputs.parameters.repo-url}} /work/src && \
+              cd /work/src && git checkout {{inputs.parameters.revision}}
+            cd /work/src
+            echo "COMMIT_SHA=$(git rev-parse HEAD)" > /work/build-info
+            cat /work/build-info
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: bundle-install
+      inputs:
+        parameters:
+          - name: ruby-version
+      container:
+        image: ruby:{{inputs.parameters.ruby-version}}-slim
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            apt-get update && apt-get install -y build-essential git libpq-dev --no-install-recommends
+            cd /work/src
+            bundle config set --local path /bundle-cache
+            bundle config set --local deployment true
+            bundle install --jobs 4 --retry 3
+            echo "Dependencies installed"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+          - name: bundle-cache
+            mountPath: /bundle-cache
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+    - name: rubocop
+      inputs:
+        parameters:
+          - name: ruby-version
+      container:
+        image: ruby:{{inputs.parameters.ruby-version}}-slim
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            cd /work/src
+            bundle config set --local path /bundle-cache
+            bundle exec rubocop --format github || true
+            echo "Lint completed"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+          - name: bundle-cache
+            mountPath: /bundle-cache
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+
+    - name: rspec
+      inputs:
+        parameters:
+          - name: ruby-version
+      container:
+        image: ruby:{{inputs.parameters.ruby-version}}-slim
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            apt-get update && apt-get install -y build-essential git libpq-dev --no-install-recommends
+            cd /work/src
+            bundle config set --local path /bundle-cache
+            bundle exec rspec --format documentation --format RSpec::Github::Formatter || \
+              bundle exec rspec --format documentation
+            echo "Tests completed"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+          - name: bundle-cache
+            mountPath: /bundle-cache
+        env:
+          - name: RAILS_ENV
+            value: test
+          - name: DATABASE_URL
+            value: "sqlite3::memory:"
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+          limits:
+            cpu: 4000m
+            memory: 4Gi
+
+    - name: kaniko-build
+      inputs:
+        parameters:
+          - name: image
+          - name: tag
+      container:
+        image: gcr.io/kaniko-project/executor:v1.23.2
+        args:
+          - --dockerfile=/work/src/Dockerfile
+          - --context=/work/src
+          - --destination={{inputs.parameters.image}}:{{inputs.parameters.tag}}
+          - --destination={{inputs.parameters.image}}:latest
+          - --cache=true
+          - --cache-repo={{inputs.parameters.image}}-cache
+          - --snapshot-mode=redo
+          - --use-new-run
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+    - name: trivy-scan
+      inputs:
+        parameters:
+          - name: image
+      container:
+        image: aquasec/trivy:0.48.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Scanning image: {{inputs.parameters.image}}"
+            trivy image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 0 \
+              {{inputs.parameters.image}}
+            echo "Scan completed"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+
+    - name: update-gitops-repo
+      inputs:
+        parameters:
+          - name: app-name
+          - name: team
+          - name: image-tag
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            apk add --no-cache yq
+
+            cd /tmp
+            git clone https://github.com/fast-ish/aws-idp-gitops.git gitops
+            cd gitops
+
+            APP_FILE="teams/{{inputs.parameters.team}}/apps/{{inputs.parameters.app-name}}/kustomization.yaml"
+
+            if [ -f "$APP_FILE" ]; then
+              echo "Updating image tag to {{inputs.parameters.image-tag}}"
+              yq -i '.images[0].newTag = "{{inputs.parameters.image-tag}}"' "$APP_FILE"
+
+              git config user.email "argoworkflows@fasti.sh"
+              git config user.name "Argo Workflows"
+              git add .
+              git commit -m "chore({{inputs.parameters.app-name}}): update image to {{inputs.parameters.image-tag}}" || echo "No changes"
+              git push origin main
+            else
+              echo "App file not found: $APP_FILE - skipping gitops update"
+            fi
+        env:
+          - name: GIT_CREDENTIALS
+            valueFrom:
+              secretKeyRef:
+                name: github-credentials
+                key: token
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: notify
+      container:
+        image: curlimages/curl:8.5.0
+        command: [sh, -c]
+        args:
+          - |
+            STATUS="success"
+            COLOR="#36a64f"
+            if [ "{{workflow.status}}" != "Succeeded" ]; then
+              STATUS="failed"
+              COLOR="#dc3545"
+            fi
+
+            curl -X POST $SLACK_WEBHOOK_URL \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"attachments\": [{
+                  \"color\": \"$COLOR\",
+                  \"title\": \"Ruby CI Pipeline $STATUS\",
+                  \"text\": \"{{workflow.parameters.app-name}} - {{workflow.parameters.revision}}\",
+                  \"fields\": [
+                    {\"title\": \"Team\", \"value\": \"{{workflow.parameters.team}}\", \"short\": true},
+                    {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true}
+                  ]
+                }]
+              }" 2>/dev/null || true
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook
+                key: url
+                optional: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi

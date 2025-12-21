@@ -1,0 +1,102 @@
+# Team namespaces for Argo Workflows
+# These namespaces are referenced in the Argo Workflows controller config
+# as workflowNamespaces where workflows can run
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-backend
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    backstage.stxkxs.io/team: backend
+    backstage.stxkxs.io/type: team-namespace
+    karpenter.sh/discovery: oyster-vpc
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-frontend
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    backstage.stxkxs.io/team: frontend
+    backstage.stxkxs.io/type: team-namespace
+    karpenter.sh/discovery: oyster-vpc
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-data
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    backstage.stxkxs.io/team: data
+    backstage.stxkxs.io/type: team-namespace
+    karpenter.sh/discovery: oyster-vpc
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-ml
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    backstage.stxkxs.io/team: ml
+    backstage.stxkxs.io/type: team-namespace
+    karpenter.sh/discovery: oyster-vpc
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-integrations
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    backstage.stxkxs.io/team: integrations
+    backstage.stxkxs.io/type: team-namespace
+    karpenter.sh/discovery: oyster-vpc
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+---
+# RBAC for Argo Workflows in team namespaces
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argo-workflows-team-executor
+  labels:
+    app.kubernetes.io/name: argo-workflows
+    app.kubernetes.io/component: rbac
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "secrets", "configmaps", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflows", "workflowtemplates", "cronworkflows", "workflowtasksets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Bind Argo Workflows service accounts to team namespaces
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-workflows-team-executor-binding
+  labels:
+    app.kubernetes.io/name: argo-workflows
+    app.kubernetes.io/component: rbac
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflow
+    namespace: argo
+  - kind: ServiceAccount
+    name: argo-workflow-controller
+    namespace: argo
+roleRef:
+  kind: ClusterRole
+  name: argo-workflows-team-executor
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,237 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: deploy-argocd-sync
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: deploy-argocd-sync
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+  annotations:
+    description: |
+      Trigger ArgoCD sync for GitOps-based deployments.
+      Updates image tag in GitOps repo and waits for ArgoCD sync.
+spec:
+  entrypoint: sync-app
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+  podGC:
+    strategy: OnWorkflowSuccess
+    deleteDelayDuration: 5m
+
+  arguments:
+    parameters:
+      - name: app-name
+        description: ArgoCD application name
+      - name: gitops-repo
+        description: GitOps repository URL
+        default: https://github.com/fast-ish/aws-idp-gitops.git
+      - name: gitops-path
+        description: Path in GitOps repo to update
+      - name: image-tag
+        description: New image tag to deploy
+      - name: revision
+        default: main
+        description: GitOps repo branch
+      - name: wait-for-sync
+        default: "true"
+        description: Wait for ArgoCD sync to complete
+      - name: sync-timeout
+        default: "300"
+        description: Timeout for sync in seconds
+
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+
+  templates:
+    - name: sync-app
+      dag:
+        tasks:
+          - name: update-gitops
+            template: update-image-tag
+            arguments:
+              parameters:
+                - name: gitops-repo
+                  value: "{{workflow.parameters.gitops-repo}}"
+                - name: gitops-path
+                  value: "{{workflow.parameters.gitops-path}}"
+                - name: image-tag
+                  value: "{{workflow.parameters.image-tag}}"
+                - name: revision
+                  value: "{{workflow.parameters.revision}}"
+
+          - name: trigger-sync
+            template: argocd-sync
+            dependencies: [update-gitops]
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+
+          - name: wait-healthy
+            template: wait-for-health
+            dependencies: [trigger-sync]
+            when: "{{workflow.parameters.wait-for-sync}} == true"
+            arguments:
+              parameters:
+                - name: app-name
+                  value: "{{workflow.parameters.app-name}}"
+                - name: timeout
+                  value: "{{workflow.parameters.sync-timeout}}"
+
+    - name: update-image-tag
+      inputs:
+        parameters:
+          - name: gitops-repo
+          - name: gitops-path
+          - name: image-tag
+          - name: revision
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            apk add --no-cache yq
+
+            echo "Cloning GitOps repo..."
+            git clone --depth 1 --branch {{inputs.parameters.revision}} \
+              {{inputs.parameters.gitops-repo}} /work/gitops
+
+            cd /work/gitops/{{inputs.parameters.gitops-path}}
+
+            echo "Updating image tag to: {{inputs.parameters.image-tag}}"
+
+            # Update kustomization.yaml if it exists
+            if [ -f kustomization.yaml ]; then
+              yq -i '.images[0].newTag = "{{inputs.parameters.image-tag}}"' kustomization.yaml
+            fi
+
+            # Update values.yaml if it exists (for Helm)
+            if [ -f values.yaml ]; then
+              yq -i '.image.tag = "{{inputs.parameters.image-tag}}"' values.yaml
+            fi
+
+            # Configure git
+            git config user.email "argo-workflows@platform.local"
+            git config user.name "Argo Workflows"
+
+            # Commit and push
+            git add -A
+            git commit -m "chore: update image tag to {{inputs.parameters.image-tag}}"
+            git push origin {{inputs.parameters.revision}}
+
+            echo "GitOps repo updated successfully"
+        env:
+          - name: GITHUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: github-token
+                key: token
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: argocd-sync
+      inputs:
+        parameters:
+          - name: app-name
+      container:
+        image: quay.io/argoproj/argocd:v2.12.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+
+            echo "Logging into ArgoCD..."
+            argocd login $ARGOCD_SERVER \
+              --username admin \
+              --password $ARGOCD_PASSWORD \
+              --insecure
+
+            echo "Triggering sync for application: {{inputs.parameters.app-name}}"
+            argocd app sync {{inputs.parameters.app-name}} \
+              --prune \
+              --timeout 60
+
+            echo "Sync triggered successfully"
+        env:
+          - name: ARGOCD_SERVER
+            valueFrom:
+              secretKeyRef:
+                name: argocd-credentials
+                key: server
+          - name: ARGOCD_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: argocd-credentials
+                key: password
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    - name: wait-for-health
+      inputs:
+        parameters:
+          - name: app-name
+          - name: timeout
+      container:
+        image: quay.io/argoproj/argocd:v2.12.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+
+            echo "Logging into ArgoCD..."
+            argocd login $ARGOCD_SERVER \
+              --username admin \
+              --password $ARGOCD_PASSWORD \
+              --insecure
+
+            echo "Waiting for application {{inputs.parameters.app-name}} to be healthy..."
+            argocd app wait {{inputs.parameters.app-name}} \
+              --health \
+              --timeout {{inputs.parameters.timeout}}
+
+            echo "Application is healthy!"
+
+            # Show application status
+            argocd app get {{inputs.parameters.app-name}}
+        env:
+          - name: ARGOCD_SERVER
+            valueFrom:
+              secretKeyRef:
+                name: argocd-credentials
+                key: server
+          - name: ARGOCD_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: argocd-credentials
+                key: password
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi

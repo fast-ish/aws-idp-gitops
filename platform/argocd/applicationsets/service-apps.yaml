@@ -1,0 +1,85 @@
+# =============================================================================
+# SERVICE APPS APPLICATIONSET
+# =============================================================================
+# Auto-discovers and deploys service applications from teams/<team>/apps/<app>/
+# Each app directory should contain a kustomization.yaml with the app manifests.
+#
+# Structure expected:
+#   teams/<team>/apps/<app-name>/
+#     ├── kustomization.yaml     # Kustomize overlay
+#     ├── rollout.yaml           # Argo Rollout (preferred) or deployment.yaml
+#     ├── service.yaml
+#     └── ...
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: service-apps
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: service-apps
+    app.kubernetes.io/component: applicationset
+    app.kubernetes.io/part-of: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        revision: HEAD
+        directories:
+          - path: "teams/*/apps/*"
+        values:
+          # Extract team and app name from path
+          # Path format: teams/<team>/apps/<app-name>
+          team: "{{index .path.segments 1}}"
+          app: "{{index .path.segments 3}}"
+  template:
+    metadata:
+      name: "{{.values.team}}-{{.values.app}}"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/name: "{{.values.app}}"
+        app.kubernetes.io/component: service
+        app.kubernetes.io/part-of: "{{.values.team}}"
+        fasti.sh/team: "{{.values.team}}"
+        fasti.sh/app-type: service
+      annotations:
+        argocd.argoproj.io/manifest-generate-paths: "{{.path.path}}"
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: "{{.values.team}}-deployments"
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: "{{.values.team}}-deployments"
+    spec:
+      project: "team-{{.values.team}}"
+      source:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        targetRevision: HEAD
+        path: "{{.path.path}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "team-{{.values.team}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=false
+          - PruneLast=true
+          - RespectIgnoreDifferences=true
+          - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+        - group: argoproj.io
+          kind: Rollout
+          jsonPointers:
+            - /status
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas
+      revisionHistoryLimit: 10

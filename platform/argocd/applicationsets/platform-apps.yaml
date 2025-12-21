@@ -1,0 +1,54 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: platform-apps
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        revision: HEAD
+        directories:
+          - path: platform/*
+          - path: platform/*/exclude
+            exclude: true
+        files:
+          - path: platform/*/kustomization.yaml
+  template:
+    metadata:
+      name: 'platform-{{.path.basename}}'
+      labels:
+        app.kubernetes.io/name: '{{.path.basename}}'
+        app.kubernetes.io/part-of: platform
+      annotations:
+        # Ensure CRDs deploy before everything else
+        {{- if eq .path.basename "prometheus-operator-crds"}}
+        argocd.argoproj.io/sync-wave: "-5"
+        {{- else}}
+        argocd.argoproj.io/sync-wave: "0"
+        {{- end}}
+    spec:
+      project: platform
+      source:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        targetRevision: HEAD
+        path: '{{.path.path}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{.path.basename}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - PrunePropagationPolicy=foreground
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

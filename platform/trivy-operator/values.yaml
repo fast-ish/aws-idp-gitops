@@ -1,0 +1,87 @@
+# Trivy Operator Helm Values
+# Continuous vulnerability scanning for Kubernetes workloads
+
+trivy:
+  # Only report HIGH and CRITICAL vulnerabilities
+  severity: HIGH,CRITICAL
+
+  # Ignore unfixed vulnerabilities to reduce noise
+  ignoreUnfixed: true
+
+  # Timeout for vulnerability scanning
+  timeout: 10m0s
+
+  # Resource limits for scanner jobs
+  resources:
+    requests:
+      cpu: 100m
+      memory: 100M
+    limits:
+      cpu: 500m
+      memory: 500M
+
+operator:
+  # Scan only current revisions (not old ReplicaSets)
+  vulnerabilityScannerScanOnlyCurrentRevisions: true
+  configAuditScannerScanOnlyCurrentRevisions: true
+
+  # Concurrent scan limit
+  scanJobsConcurrentLimit: 5
+
+  # Retry failed scans
+  scanJobsRetryDelay: 30s
+
+  # Enable config audit scanner (checks for misconfigurations)
+  configAuditScannerEnabled: true
+
+  # Enable RBAC assessment
+  rbacAssessmentScannerEnabled: true
+
+  # Enable exposed secret scanning
+  exposedSecretScannerEnabled: true
+
+  # Scan namespaces (empty = all namespaces)
+  # Exclude system namespaces from scanning
+  excludeNamespaces: "kube-system,kube-public,kube-node-lease"
+
+# Add labels to generated reports for querying
+trivyOperator:
+  reportResourceLabels: "app.kubernetes.io/name,app.kubernetes.io/team,fasti.sh/team"
+
+  # Metrics labels
+  metricsResourceLabelsPrefix: trivy_
+
+# Service Account
+serviceAccount:
+  create: true
+  name: trivy-operator
+  annotations: {}
+
+# ServiceMonitor for Prometheus scraping
+serviceMonitor:
+  enabled: true
+  namespace: trivy-system
+  interval: 60s
+  labels:
+    release: prometheus
+
+# Resource limits for operator
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Pod security context
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10000
+  fsGroup: 10000

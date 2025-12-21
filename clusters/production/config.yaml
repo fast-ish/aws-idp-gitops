@@ -1,0 +1,34 @@
+# Cluster-specific configuration values
+# These values are used by kustomize replacements to configure platform components
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-config
+  namespace: kube-system
+data:
+  # AWS Configuration
+  AWS_ACCOUNT_ID: "351619759866"
+  AWS_REGION: "us-west-2"
+  ECR_REGISTRY: "351619759866.dkr.ecr.us-west-2.amazonaws.com"
+
+  # Cluster Configuration
+  CLUSTER_NAME: "production"
+  CLUSTER_DOMAIN: "internal"
+
+  # GitOps Repository
+  GITOPS_REPO: "https://github.com/fast-ish/aws-idp-gitops.git"
+  GITOPS_ORG: "fast-ish"
+
+  # Service URLs (internal DNS)
+  ARGOCD_URL: "https://argocd.internal"
+  ARGO_WORKFLOWS_URL: "https://workflows.internal"
+  GRAFANA_URL: "https://grafana.internal"
+  PROMETHEUS_URL: "https://prometheus.internal"
+  ALERTMANAGER_URL: "https://alertmanager.internal"
+
+  # Cost Management
+  KUBECOST_URL: "https://kubecost.internal"
+
+  # Image Signing
+  COSIGN_KMS_KEY: "awskms:///arn:aws:kms:us-west-2:351619759866:alias/idp-cosign"

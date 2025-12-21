@@ -1,0 +1,54 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: team-apps
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - matrix:
+        generators:
+          # First generator: get team info
+          - git:
+              repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+              revision: HEAD
+              files:
+                - path: "teams/*/team.yaml"
+          # Second generator: iterate over apps in each team
+          - list:
+              elementsYaml: "{{.apps | toJson}}"
+  template:
+    metadata:
+      name: "{{.path.basename}}-{{.name}}"
+      labels:
+        app.kubernetes.io/name: "{{.name}}"
+        app.kubernetes.io/component: application
+        app.kubernetes.io/part-of: "{{.path.basename}}"
+        team: "{{.path.basename}}"
+        environment: "{{.environment}}"
+      annotations:
+        team.owner: "{{.owner.email}}"
+        team.slack: "{{.owner.slack}}"
+    spec:
+      project: "team-{{.path.basename}}"
+      source:
+        repoURL: "{{.repoURL}}"
+        targetRevision: "{{.targetRevision}}"
+        path: "{{.manifestPath}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{.namespace}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=false
+          - PruneLast=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

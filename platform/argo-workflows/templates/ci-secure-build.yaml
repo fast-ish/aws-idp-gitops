@@ -1,0 +1,325 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ci-secure-build
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: ci-secure-build
+    app.kubernetes.io/component: workflow-template
+    app.kubernetes.io/part-of: argo-workflows
+  annotations:
+    description: |
+      Secure CI pipeline with vulnerability scanning, SBOM generation, and image signing.
+      Includes: Git clone -> Build -> Trivy Scan -> SBOM -> Cosign Sign
+spec:
+  entrypoint: secure-build-pipeline
+  serviceAccountName: argo-workflow
+  ttlStrategy:
+    secondsAfterCompletion: 3600
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 86400
+  podGC:
+    strategy: OnWorkflowSuccess
+    deleteDelayDuration: 5m
+
+  arguments:
+    parameters:
+      - name: repo-url
+        description: Git repository URL
+      - name: revision
+        description: Git revision (branch, tag, or commit SHA)
+        default: main
+      - name: image-name
+        description: Full ECR image name (without tag)
+      - name: dockerfile
+        description: Path to Dockerfile
+        default: Dockerfile
+      - name: context
+        description: Docker build context path
+        default: "."
+      - name: severity-threshold
+        description: Trivy severity threshold (CRITICAL,HIGH,MEDIUM,LOW)
+        default: "HIGH,CRITICAL"
+      - name: fail-on-vuln
+        description: Fail pipeline if vulnerabilities found
+        default: "false"
+
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+
+  templates:
+    - name: secure-build-pipeline
+      dag:
+        tasks:
+          - name: clone
+            template: git-clone
+            arguments:
+              parameters:
+                - name: repo-url
+                  value: "{{workflow.parameters.repo-url}}"
+                - name: revision
+                  value: "{{workflow.parameters.revision}}"
+
+          - name: build
+            template: kaniko-build
+            dependencies: [clone]
+            arguments:
+              parameters:
+                - name: image-name
+                  value: "{{workflow.parameters.image-name}}"
+                - name: dockerfile
+                  value: "{{workflow.parameters.dockerfile}}"
+                - name: context
+                  value: "{{workflow.parameters.context}}"
+
+          - name: scan
+            template: trivy-scan
+            dependencies: [build]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.image-name}}:{{workflow.parameters.revision}}"
+                - name: severity
+                  value: "{{workflow.parameters.severity-threshold}}"
+                - name: fail-on-vuln
+                  value: "{{workflow.parameters.fail-on-vuln}}"
+
+          - name: sbom
+            template: generate-sbom
+            dependencies: [build]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.image-name}}:{{workflow.parameters.revision}}"
+
+          - name: sign
+            template: cosign-sign
+            dependencies: [scan, sbom]
+            arguments:
+              parameters:
+                - name: image
+                  value: "{{workflow.parameters.image-name}}:{{workflow.parameters.revision}}"
+
+    # Git Clone Template
+    - name: git-clone
+      inputs:
+        parameters:
+          - name: repo-url
+          - name: revision
+      container:
+        image: alpine/git:2.43.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Cloning {{inputs.parameters.repo-url}} at {{inputs.parameters.revision}}"
+            git clone --depth 1 --branch {{inputs.parameters.revision}} \
+              {{inputs.parameters.repo-url}} /work/src
+            cd /work/src
+            echo "COMMIT_SHA=$(git rev-parse HEAD)" > /work/build-info
+            echo "COMMIT_SHORT=$(git rev-parse --short HEAD)" >> /work/build-info
+            echo "COMMIT_MESSAGE=$(git log -1 --pretty=%B)" >> /work/build-info
+            cat /work/build-info
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+
+    # Kaniko Build Template
+    - name: kaniko-build
+      inputs:
+        parameters:
+          - name: image-name
+          - name: dockerfile
+          - name: context
+      container:
+        image: gcr.io/kaniko-project/executor:v1.23.2
+        args:
+          - --dockerfile=/work/src/{{inputs.parameters.context}}/{{inputs.parameters.dockerfile}}
+          - --context=/work/src/{{inputs.parameters.context}}
+          - --destination={{inputs.parameters.image-name}}:{{workflow.parameters.revision}}
+          - --destination={{inputs.parameters.image-name}}:latest
+          - --cache=true
+          - --cache-repo={{inputs.parameters.image-name}}-cache
+          - --snapshot-mode=redo
+          - --use-new-run
+          # Output digest for signing
+          - --digest-file=/work/image-digest
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+    # Trivy Vulnerability Scan Template
+    - name: trivy-scan
+      inputs:
+        parameters:
+          - name: image
+          - name: severity
+          - name: fail-on-vuln
+      outputs:
+        artifacts:
+          - name: trivy-report
+            path: /work/trivy-report.json
+            archive:
+              none: {}
+      container:
+        image: aquasec/trivy:0.48.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Scanning image: {{inputs.parameters.image}}"
+
+            # Run vulnerability scan
+            trivy image \
+              --severity {{inputs.parameters.severity}} \
+              --format json \
+              --output /work/trivy-report.json \
+              --ignore-unfixed \
+              {{inputs.parameters.image}}
+
+            # Display summary
+            trivy image \
+              --severity {{inputs.parameters.severity}} \
+              --ignore-unfixed \
+              {{inputs.parameters.image}}
+
+            # Check for critical vulnerabilities
+            CRITICAL_COUNT=$(cat /work/trivy-report.json | jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length')
+            HIGH_COUNT=$(cat /work/trivy-report.json | jq '[.Results[].Vulnerabilities[]? | select(.Severity=="HIGH")] | length')
+
+            echo "Found $CRITICAL_COUNT critical and $HIGH_COUNT high vulnerabilities"
+
+            if [ "{{inputs.parameters.fail-on-vuln}}" = "true" ] && [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "ERROR: Critical vulnerabilities found, failing build"
+              exit 1
+            fi
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+
+    # SBOM Generation Template
+    - name: generate-sbom
+      inputs:
+        parameters:
+          - name: image
+      outputs:
+        artifacts:
+          - name: sbom
+            path: /work/sbom.spdx.json
+            archive:
+              none: {}
+      container:
+        image: anchore/syft:v0.98.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Generating SBOM for: {{inputs.parameters.image}}"
+
+            # Generate SBOM in SPDX format
+            syft {{inputs.parameters.image}} \
+              -o spdx-json=/work/sbom.spdx.json
+
+            # Also generate CycloneDX format
+            syft {{inputs.parameters.image}} \
+              -o cyclonedx-json=/work/sbom.cyclonedx.json
+
+            echo "SBOM generated successfully"
+            echo "Packages found: $(cat /work/sbom.spdx.json | jq '.packages | length')"
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+
+    # Cosign Image Signing Template
+    - name: cosign-sign
+      inputs:
+        parameters:
+          - name: image
+      container:
+        image: gcr.io/projectsigstore/cosign:v2.2.2
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Signing image: {{inputs.parameters.image}}"
+
+            # Sign image using AWS KMS key (requires IRSA)
+            # The KMS key ARN should be set via environment variable
+            cosign sign \
+              --key awskms:///${KMS_KEY_ARN} \
+              --tlog-upload=false \
+              {{inputs.parameters.image}}
+
+            echo "Image signed successfully"
+
+            # Attach SBOM as attestation
+            if [ -f /work/sbom.spdx.json ]; then
+              echo "Attaching SBOM attestation..."
+              cosign attest \
+                --key awskms:///${KMS_KEY_ARN} \
+                --predicate /work/sbom.spdx.json \
+                --type spdxjson \
+                --tlog-upload=false \
+                {{inputs.parameters.image}}
+              echo "SBOM attestation attached"
+            fi
+
+            # Verify signature
+            echo "Verifying signature..."
+            cosign verify \
+              --key awskms:///${KMS_KEY_ARN} \
+              {{inputs.parameters.image}}
+
+            echo "Signature verified successfully"
+        env:
+          - name: AWS_REGION
+            value: us-west-2
+          - name: KMS_KEY_ARN
+            valueFrom:
+              secretKeyRef:
+                name: cosign-kms
+                key: kms_key_arn
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi

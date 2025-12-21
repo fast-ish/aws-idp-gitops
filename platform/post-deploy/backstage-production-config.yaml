@@ -1,0 +1,129 @@
+# Backstage production configuration
+# This ConfigMap contains app-config.production.yaml overrides
+# Applied after all stacks (Backstage, ArgoCD, Argo Workflows) are deployed
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backstage-app-config-production
+  namespace: backstage
+  labels:
+    app.kubernetes.io/name: backstage
+    app.kubernetes.io/component: config
+    app.kubernetes.io/part-of: backstage
+  annotations:
+    description: Production configuration for Backstage with Argo integrations
+data:
+  app-config.production.yaml: |
+    # =============================================================================
+    # Backstage Production Configuration
+    # This file is merged with app-config.yaml at runtime
+    # =============================================================================
+
+    app:
+      baseUrl: https://backstage.stxkxs.io
+
+    backend:
+      baseUrl: https://backstage.stxkxs.io
+      cors:
+        origin: https://backstage.stxkxs.io
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Integration
+    # -------------------------------------------------------------------------
+    argocd:
+      baseUrl: https://argocd.devops.stxkxs.io
+      appLocatorMethods:
+        - type: 'config'
+          instances:
+            - name: main
+              url: https://argocd.devops.stxkxs.io
+
+    # -------------------------------------------------------------------------
+    # Argo Workflows Integration
+    # -------------------------------------------------------------------------
+    argoWorkflows:
+      baseUrl: https://workflows.backstage.stxkxs.io
+
+    # -------------------------------------------------------------------------
+    # Kubernetes Plugin Configuration
+    # -------------------------------------------------------------------------
+    kubernetes:
+      serviceLocatorMethod:
+        type: multiTenant
+      clusterLocatorMethods:
+        - type: config
+          clusters:
+            - name: oyster-eks
+              url: ${K8S_API_URL}
+              authProvider: serviceAccount
+              skipTLSVerify: false
+              skipMetricsLookup: false
+              customResources:
+                # Argo Rollouts
+                - group: argoproj.io
+                  apiVersion: v1alpha1
+                  plural: rollouts
+                - group: argoproj.io
+                  apiVersion: v1alpha1
+                  plural: analysisruns
+                # Argo Workflows
+                - group: argoproj.io
+                  apiVersion: v1alpha1
+                  plural: workflows
+                - group: argoproj.io
+                  apiVersion: v1alpha1
+                  plural: workflowtemplates
+                # Karpenter
+                - group: karpenter.sh
+                  apiVersion: v1
+                  plural: nodepools
+                - group: karpenter.k8s.aws
+                  apiVersion: v1
+                  plural: ec2nodeclasses
+
+    # -------------------------------------------------------------------------
+    # Proxy Endpoints for Argo UIs
+    # -------------------------------------------------------------------------
+    proxy:
+      endpoints:
+        '/argocd/api':
+          target: https://argocd.devops.stxkxs.io/api/v1
+          changeOrigin: true
+          secure: true
+          headers:
+            Cookie: argocd.token=${ARGOCD_AUTH_TOKEN}
+        '/argo-workflows/api':
+          target: https://workflows.backstage.stxkxs.io/api/v1
+          changeOrigin: true
+          secure: true
+        '/argo-rollouts/api':
+          target: http://argo-rollouts-dashboard.argo-rollouts:3100/api/v1
+          changeOrigin: true
+
+    # -------------------------------------------------------------------------
+    # TechDocs - Production S3 Storage
+    # -------------------------------------------------------------------------
+    techdocs:
+      builder: 'external'
+      generator:
+        runIn: 'local'
+      publisher:
+        type: 'awsS3'
+        awsS3:
+          bucketName: oyster-techdocs
+          region: us-west-2
+---
+# Patch to mount the production config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backstage-env-config
+  namespace: backstage
+  labels:
+    app.kubernetes.io/name: backstage
+    app.kubernetes.io/component: env
+data:
+  # Kubernetes API URL - populated from EKS cluster endpoint
+  K8S_API_URL: "https://801D7A7AF97416259F596F7B1C3D18B9.gr7.us-west-2.eks.amazonaws.com"
+  # ArgoCD auth token - populated from secret
+  # ARGOCD_AUTH_TOKEN is set via ExternalSecret

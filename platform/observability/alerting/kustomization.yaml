@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: observability
+
+resources:
+  # Core alerting
+  - prometheus-rules.yaml
+  - alertmanager-config.yaml
+  - cost-alerts.yaml
+  - slo-rules.yaml
+
+  # SLO burn rate (multi-window)
+  - slo-burn-rate-multiwindow.yaml
+
+  # Trace-deployment correlation
+  - trace-alerts.yaml
+
+  # Resource optimization
+  - rightsizing-alerts.yaml
+  - idle-resource-alerts.yaml
+
+  # Backup & restore
+  - velero-alerts.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: observability
+  app.kubernetes.io/component: alerting

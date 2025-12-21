@@ -1,0 +1,35 @@
+# =============================================================================
+# ADD GOLDILOCKS LABEL TO TEAM NAMESPACES
+# =============================================================================
+# Automatically enables Goldilocks VPA recommendations for team namespaces.
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enable-goldilocks-for-teams
+  annotations:
+    policies.kyverno.io/title: Enable Goldilocks for Team Namespaces
+    policies.kyverno.io/category: Resource Optimization
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/subject: Namespace
+    policies.kyverno.io/description: >-
+      Automatically adds the goldilocks.fairwinds.com/enabled label to team
+      namespaces so they get VPA recommendations.
+spec:
+  rules:
+    - name: add-goldilocks-label
+      match:
+        any:
+          - resources:
+              kinds:
+                - Namespace
+              names:
+                - "team-*"
+                - "dev-*"
+                - "staging-*"
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              +(goldilocks.fairwinds.com/enabled): "true"
+              +(goldilocks.fairwinds.com/vpa-update-mode): "off"

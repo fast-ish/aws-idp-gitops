@@ -1,0 +1,79 @@
+team: ml
+namespace: team-ml
+description: "Machine learning - model training, inference, and feature engineering"
+
+owner:
+  name: "ML Team"
+  email: ml@example.com
+  slack: "#ml-eng"
+
+resourceQuota:
+  requests:
+    cpu: "32"
+    memory: "128Gi"
+  limits:
+    cpu: "64"
+    memory: "256Gi"
+  pods: "25"
+  services: "10"
+  configmaps: "20"
+  secrets: "20"
+  persistentvolumeclaims: "15"
+
+limitRange:
+  default:
+    cpu: "2"
+    memory: "4Gi"
+  defaultRequest:
+    cpu: "500m"
+    memory: "1Gi"
+  max:
+    cpu: "16"
+    memory: "64Gi"
+
+networkPolicy:
+  allowIngress: true
+  allowEgress: true
+  allowFromNamespaces:
+    - team-backend
+    - team-data
+    - argocd
+    - monitoring
+
+# GPU node selection for ML workloads
+nodeSelector:
+  workload-type: ml
+
+tolerations:
+  - key: "workload-type"
+    operator: "Equal"
+    value: "ml"
+    effect: "NoSchedule"
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+apps:
+  - name: model-serving
+    repoURL: https://github.com/fast-ish/model-serving
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: feature-store
+    repoURL: https://github.com/fast-ish/feature-store
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: prediction-api
+    repoURL: https://github.com/fast-ish/prediction-api
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: ml-pipelines
+    repoURL: https://github.com/fast-ish/ml-pipelines
+    manifestPath: k8s
+    targetRevision: main
+    environment: production

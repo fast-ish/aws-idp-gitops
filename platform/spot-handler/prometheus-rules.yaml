@@ -1,0 +1,133 @@
+# =============================================================================
+# SPOT INTERRUPTION ALERTS
+# =============================================================================
+# Monitors spot instance interruptions and related events.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: spot-interruption-alerts
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: spot-interruption-alerts
+    app.kubernetes.io/component: alerting
+    app.kubernetes.io/part-of: spot-handler
+    prometheus: main
+spec:
+  groups:
+    - name: spot.interruptions
+      interval: 15s
+      rules:
+        # Recording rules
+        - record: karpenter:spot:interruptions_total
+          expr: |
+            sum(increase(aws_node_termination_handler_actions_total{action="cordon-and-drain"}[1h]))
+
+        - record: karpenter:spot:rebalance_recommendations_total
+          expr: |
+            sum(increase(aws_node_termination_handler_actions_total{action="rebalance-recommendation"}[1h]))
+
+        # High interruption rate
+        - alert: HighSpotInterruptionRate
+          expr: |
+            sum(rate(aws_node_termination_handler_actions_total{action="cordon-and-drain"}[30m])) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+            category: infrastructure
+            team: platform
+          annotations:
+            summary: "High spot interruption rate detected"
+            description: "More than 6 spot interruptions per hour. Consider increasing on-demand capacity or adjusting workload distribution."
+            runbook_url: "https://wiki.internal/runbooks/spot-interruptions"
+
+        # Spot drain failed
+        - alert: SpotInterruptionDrainFailed
+          expr: |
+            increase(aws_node_termination_handler_actions_total{action="uncordon-after-drain-failure"}[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            category: infrastructure
+            team: platform
+          annotations:
+            summary: "Spot interruption drain failed"
+            description: "Failed to drain pods before spot termination. Some pods may have been forcefully terminated."
+            action: "Check pod logs and verify application health"
+
+        # Multiple rebalance recommendations (warning of upcoming interruptions)
+        - alert: SpotRebalanceWarning
+          expr: |
+            increase(aws_node_termination_handler_actions_total{action="rebalance-recommendation"}[10m]) > 3
+          for: 0m
+          labels:
+            severity: warning
+            category: infrastructure
+            team: platform
+          annotations:
+            summary: "Multiple spot rebalance recommendations"
+            description: "AWS is recommending rebalancing multiple spot instances. Interruptions may be imminent."
+            action: "Consider proactively migrating workloads"
+
+        # Node termination handler not running on spot nodes
+        - alert: NodeTerminationHandlerMissing
+          expr: |
+            count(kube_node_labels{label_karpenter_sh_capacity_type="spot"}) > 0
+            and
+            count(kube_pod_info{pod=~"aws-node-termination-handler.*"}) == 0
+          for: 5m
+          labels:
+            severity: critical
+            category: infrastructure
+            team: platform
+          annotations:
+            summary: "Node termination handler not running"
+            description: "Spot nodes exist but node termination handler is not running. Spot interruptions will not be handled gracefully."
+
+        # Scheduled maintenance event
+        - alert: ScheduledMaintenanceEvent
+          expr: |
+            increase(aws_node_termination_handler_actions_total{action="scheduled-event"}[1h]) > 0
+          for: 0m
+          labels:
+            severity: info
+            category: infrastructure
+            team: platform
+          annotations:
+            summary: "AWS scheduled maintenance event detected"
+            description: "A scheduled maintenance event has been detected. Node will be drained automatically."
+
+    - name: spot.capacity
+      interval: 1m
+      rules:
+        # Spot vs on-demand ratio
+        - record: cluster:nodes:spot_ratio
+          expr: |
+            count(kube_node_labels{label_karpenter_sh_capacity_type="spot"}) /
+            count(kube_node_labels)
+
+        # Alert if too many spot nodes
+        - alert: HighSpotNodeRatio
+          expr: |
+            cluster:nodes:spot_ratio > 0.8
+          for: 30m
+          labels:
+            severity: warning
+            category: infrastructure
+          annotations:
+            summary: "High spot node ratio"
+            description: "More than 80% of nodes are spot instances. Consider increasing on-demand capacity for stability."
+
+        # Alert if no spot nodes (cost optimization opportunity)
+        - alert: NoSpotNodes
+          expr: |
+            cluster:nodes:spot_ratio == 0
+            and
+            count(kube_node_labels) > 3
+          for: 1h
+          labels:
+            severity: info
+            category: cost
+          annotations:
+            summary: "No spot nodes in cluster"
+            description: "Cluster has no spot instances. Consider enabling spot for cost savings."

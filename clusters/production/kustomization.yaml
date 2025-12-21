@@ -1,0 +1,81 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# =============================================================================
+# DEPLOYMENT SPLIT:
+# - CDK (addons.mustache): Helm charts with IRSA, core infrastructure
+# - GitOps (this file): CRDs, policies, templates, configurations
+#
+# CDK deploys: external-secrets, kyverno, argocd, argo-workflows,
+#              k8s-monitoring (Grafana Cloud), metrics-server, etc.
+# GitOps deploys: Policies, templates, custom resources, additional components
+# =============================================================================
+
+resources:
+  # Cluster configuration
+  - config.yaml
+
+  # Kyverno policies (controller deployed via CDK)
+  - ../../platform/kyverno/policies/baseline
+  - ../../platform/kyverno/policies/best-practices
+  - ../../platform/kyverno/policies/compliance
+  - ../../platform/kyverno/policies/cost
+  - ../../platform/kyverno/policies/mutations
+  - ../../platform/kyverno/policies/security
+  - ../../platform/kyverno/policies/generators
+  - ../../platform/kyverno/policies/secrets
+
+  # ArgoCD configurations (controller deployed via CDK)
+  - ../../platform/argocd/project-platform.yaml
+  - ../../platform/argocd/applicationsets
+  - ../../platform/argocd/notifications-cm.yaml
+  - ../../platform/argocd/notifications-secret.yaml
+
+  # Argo Workflows templates (controller deployed via CDK)
+  - ../../platform/argo-workflows/templates
+
+  # External Secrets configurations (controller deployed via CDK)
+  - ../../platform/external-secrets/cluster-secret-store.yaml
+  - ../../platform/external-secrets/external-secrets
+
+  # Progressive Delivery - Argo Rollouts
+  - ../../platform/argo-rollouts
+
+  # Event-Driven - Argo Events
+  - ../../platform/argo-events
+
+  # Runtime Security - Falco
+  - ../../platform/falco
+
+  # Vulnerability Scanning - Trivy
+  - ../../platform/trivy-operator
+
+  # Custom alerting rules (Grafana Cloud handles collection)
+  # Cost alerting is also here (uses OpenCost metrics from k8s-monitoring)
+  - ../../platform/observability
+
+  # Resource Optimization - VPA
+  - ../../platform/vpa
+
+  # Resource Optimization - Goldilocks (VPA Dashboard)
+  - ../../platform/goldilocks
+
+  # Spot Instance Handling - AWS Node Termination Handler
+  - ../../platform/spot-handler
+
+  # Governance - Drift Detection & Deployment Windows
+  - ../../platform/governance
+
+  # Backup & Restore - Velero
+  - ../../platform/velero
+
+  # Developer Portal - Backstage
+  - ../../platform/backstage
+
+  # Network Policies - Defense in depth
+  - ../../platform/network-policies
+
+# Common labels for all resources
+commonLabels:
+  cluster: production
+  environment: production

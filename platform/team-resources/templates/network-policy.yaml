@@ -1,0 +1,70 @@
+{{- if or .Values.networkPolicy.allowIngress .Values.networkPolicy.allowEgress }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.team.name }}-default
+  namespace: {{ .Values.team.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.team.name }}
+    app.kubernetes.io/component: network-policy
+    team: {{ .Values.team.name }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic from same namespace
+    - from:
+        - podSelector: {}
+    # Allow traffic from ingress controller
+    {{- if .Values.networkPolicy.allowIngress }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+    {{- end }}
+    # Allow from specified namespaces
+    {{- if .Values.networkPolicy.allowFromNamespacesRaw }}
+    {{- $namespaces := splitList "," .Values.networkPolicy.allowFromNamespacesRaw }}
+    {{- range $namespaces }}
+    {{- if . }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow traffic within namespace
+    - to:
+        - podSelector: {}
+    {{- if .Values.networkPolicy.allowEgress }}
+    # Allow egress to internet (for external APIs)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    # Allow egress to cluster services
+    - to:
+        - namespaceSelector: {}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,162 @@
+# =============================================================================
+# PR PREVIEW ENVIRONMENTS
+# =============================================================================
+# Automatically creates ephemeral preview environments for each pull request.
+# Preview environments are automatically deleted when the PR is closed/merged.
+#
+# Features:
+# - Isolated namespace per PR
+# - Automatic DNS: pr-<number>.<app>.<team>.preview.fasti.sh
+# - Resource-limited (50% of prod)
+# - Auto-cleanup after PR close
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: pr-previews
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: pr-previews
+    app.kubernetes.io/component: applicationset
+    app.kubernetes.io/part-of: argocd
+    fasti.sh/environment: preview
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - pullRequest:
+        github:
+          owner: fast-ish
+          repo: "{{.app}}"
+          tokenRef:
+            secretName: github-token
+            key: token
+          labels:
+            - preview
+        requeueAfterSeconds: 60
+  template:
+    metadata:
+      name: "preview-{{.app}}-pr-{{.number}}"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/name: "{{.app}}"
+        app.kubernetes.io/instance: "pr-{{.number}}"
+        app.kubernetes.io/component: preview
+        fasti.sh/environment: preview
+        fasti.sh/pr-number: "{{.number}}"
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: previews
+        argocd.argoproj.io/manifest-generate-paths: .
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: previews
+      source:
+        repoURL: "https://github.com/fast-ish/{{.app}}.git"
+        targetRevision: "{{.head_sha}}"
+        path: k8s
+        kustomize:
+          nameSuffix: "-pr-{{.number}}"
+          commonLabels:
+            fasti.sh/preview: "true"
+            fasti.sh/pr: "{{.number}}"
+          images:
+            - "IMAGE_PLACEHOLDER=351619759866.dkr.ecr.us-west-2.amazonaws.com/preview/{{.app}}:pr-{{.number}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "preview-{{.app}}-pr-{{.number}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 1m
+      # Resource overrides for preview environments
+      ignoreDifferences:
+        - group: argoproj.io
+          kind: Rollout
+          jsonPointers:
+            - /spec/replicas
+---
+# =============================================================================
+# PREVIEW NAMESPACE TEMPLATE
+# =============================================================================
+# ResourceQuota and LimitRange for preview environments
+# Limits resources to prevent runaway costs
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: pr-preview-namespaces
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - pullRequest:
+        github:
+          owner: fast-ish
+          repo: "{{.app}}"
+          tokenRef:
+            secretName: github-token
+            key: token
+          labels:
+            - preview
+        requeueAfterSeconds: 60
+  template:
+    metadata:
+      name: "preview-ns-{{.app}}-pr-{{.number}}"
+      namespace: argocd
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: previews
+      source:
+        repoURL: https://github.com/fast-ish/aws-idp-gitops.git
+        targetRevision: HEAD
+        path: platform/preview-resources
+        helm:
+          values: |
+            namespace: preview-{{.app}}-pr-{{.number}}
+            app: {{.app}}
+            prNumber: {{.number}}
+            ttlHours: 72
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "preview-{{.app}}-pr-{{.number}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+---
+# =============================================================================
+# ARGOCD PROJECT FOR PREVIEWS
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: previews
+  namespace: argocd
+spec:
+  description: "Preview environments for pull requests"
+  sourceRepos:
+    - "https://github.com/fast-ish/*"
+  destinations:
+    - namespace: "preview-*"
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  orphanedResources:
+    warn: true

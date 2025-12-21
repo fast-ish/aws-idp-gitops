@@ -1,0 +1,72 @@
+team: backend
+namespace: team-backend
+description: "Backend services - APIs, microservices, and core business logic"
+
+owner:
+  name: "Backend Team"
+  email: backend@example.com
+  slack: "#backend-eng"
+
+resourceQuota:
+  requests:
+    cpu: "20"
+    memory: "40Gi"
+  limits:
+    cpu: "40"
+    memory: "80Gi"
+  pods: "50"
+  services: "20"
+  configmaps: "30"
+  secrets: "30"
+  persistentvolumeclaims: "10"
+
+limitRange:
+  default:
+    cpu: "500m"
+    memory: "512Mi"
+  defaultRequest:
+    cpu: "100m"
+    memory: "128Mi"
+  max:
+    cpu: "4"
+    memory: "8Gi"
+
+networkPolicy:
+  allowIngress: true
+  allowEgress: true
+  allowFromNamespaces:
+    - team-frontend
+    - team-integrations
+    - argocd
+    - monitoring
+
+apps:
+  - name: version-api
+    repoURL: https://github.com/fast-ish/version-api
+    manifestPath: k8s
+    targetRevision: v1.0.0
+    environment: production
+
+  - name: user-service
+    repoURL: https://github.com/fast-ish/user-service
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: order-service
+    repoURL: https://github.com/fast-ish/order-service
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: inventory-service
+    repoURL: https://github.com/fast-ish/inventory-service
+    manifestPath: k8s
+    targetRevision: main
+    environment: production
+
+  - name: notification-service
+    repoURL: https://github.com/fast-ish/notification-service
+    manifestPath: k8s
+    targetRevision: main
+    environment: production

@@ -1,0 +1,55 @@
+replicaCount: 1
+
+config:
+  debug: false
+  customfields: "environment:production,platform:idp"
+  mutualtlsfilespath: ""
+
+  slack:
+    webhookurl: ""
+    minimumpriority: warning
+    outputformat: all
+
+  prometheus:
+    hostport: ""
+    extralabels: ""
+
+  elasticsearch:
+    hostport: ""
+    index: falco
+    type: _doc
+
+  loki:
+    hostport: "http://loki.observability.svc.cluster.local:3100"
+    minimumpriority: notice
+    tenant: ""
+
+  alertmanager:
+    hostport: ""
+    minimumpriority: critical
+    endpoint: /api/v1/alerts
+
+webui:
+  enabled: true
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 100m
+    memory: 128Mi
+
+serviceMonitor:
+  enabled: true
+
+ingress:
+  enabled: false

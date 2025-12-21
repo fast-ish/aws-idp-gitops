@@ -1,0 +1,33 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-cost-labels
+  annotations:
+    policies.kyverno.io/title: Require Cost Allocation Labels
+    policies.kyverno.io/category: Cost Management
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Deployment, StatefulSet, Job
+    policies.kyverno.io/description: >-
+      Ensures workloads have required labels for cost allocation and tracking.
+      Labels are used by Kubecost to attribute costs to teams and services.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-team-label
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - Job
+              namespaces:
+                - "team-*"
+      validate:
+        message: "Missing required cost labels: fasti.sh/team and fasti.sh/service"
+        pattern:
+          metadata:
+            labels:
+              fasti.sh/team: "?*"
+              fasti.sh/service: "?*"

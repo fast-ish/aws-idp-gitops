@@ -1,0 +1,199 @@
+# =============================================================================
+# DEPLOYMENT FREEZE SCHEDULER
+# =============================================================================
+# Automated freeze windows for weekends and off-hours.
+# =============================================================================
+
+# Freeze on Friday evening (8 PM Pacific = Saturday 4 AM UTC)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: deployment-freeze-weekend
+  namespace: governance
+  labels:
+    app.kubernetes.io/name: deployment-freeze
+    app.kubernetes.io/component: scheduler
+spec:
+  schedule: "0 4 * * 6"  # Saturday 4 AM UTC
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: deployment-freeze-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: freeze
+              image: bitnami/kubectl:1.29
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  kubectl patch configmap deployment-windows -n governance --type=merge -p '{
+                    "data": {
+                      "status": "frozen",
+                      "freeze_reason": "Weekend deployment freeze",
+                      "freeze_start": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+                    }
+                  }'
+                  echo "Weekend freeze activated"
+---
+# Unfreeze on Monday morning (6 AM Pacific = 2 PM UTC)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: deployment-unfreeze-monday
+  namespace: governance
+  labels:
+    app.kubernetes.io/name: deployment-freeze
+    app.kubernetes.io/component: scheduler
+spec:
+  schedule: "0 14 * * 1"  # Monday 2 PM UTC
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: deployment-freeze-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: unfreeze
+              image: bitnami/kubectl:1.29
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  kubectl patch configmap deployment-windows -n governance --type=merge -p '{
+                    "data": {
+                      "status": "open",
+                      "freeze_reason": "",
+                      "freeze_end": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+                    }
+                  }'
+                  echo "Weekend freeze deactivated"
+---
+# Freeze on weekday evenings (8 PM Pacific = 4 AM UTC next day)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: deployment-freeze-evening
+  namespace: governance
+  labels:
+    app.kubernetes.io/name: deployment-freeze
+    app.kubernetes.io/component: scheduler
+spec:
+  schedule: "0 4 * * 2-6"  # Tuesday-Saturday 4 AM UTC (Mon-Fri 8 PM Pacific)
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: deployment-freeze-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: freeze
+              image: bitnami/kubectl:1.29
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # Only freeze production environment at night
+                  kubectl patch configmap deployment-windows -n governance --type=merge -p '{
+                    "data": {
+                      "auto_freeze_environments": "prod",
+                      "freeze_reason": "Off-hours production freeze"
+                    }
+                  }'
+                  echo "Evening production freeze activated"
+---
+# Unfreeze on weekday mornings (6 AM Pacific = 2 PM UTC)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: deployment-unfreeze-morning
+  namespace: governance
+  labels:
+    app.kubernetes.io/name: deployment-freeze
+    app.kubernetes.io/component: scheduler
+spec:
+  schedule: "0 14 * * 1-5"  # Monday-Friday 2 PM UTC (6 AM Pacific)
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: deployment-freeze-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: unfreeze
+              image: bitnami/kubectl:1.29
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # Clear evening freeze
+                  kubectl patch configmap deployment-windows -n governance --type=merge -p '{
+                    "data": {
+                      "auto_freeze_environments": "",
+                      "freeze_reason": ""
+                    }
+                  }'
+                  echo "Morning unfreeze activated"
+---
+# =============================================================================
+# FREEZE STATUS NOTIFICATION
+# =============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: deployment-freeze-notify
+  namespace: governance
+  labels:
+    app.kubernetes.io/name: deployment-freeze
+    app.kubernetes.io/component: notification
+spec:
+  schedule: "0 * * * *"  # Every hour
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: deployment-freeze-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: notify
+              image: curlimages/curl:8.5.0
+              env:
+                - name: SLACK_WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: slack-webhook
+                      key: url
+                      optional: true
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  if [ -z "$SLACK_WEBHOOK_URL" ]; then
+                    echo "Slack not configured"
+                    exit 0
+                  fi
+
+                  # This job only runs during transitions
+                  # Actual notification logic would check state changes
+                  echo "Freeze status check completed"

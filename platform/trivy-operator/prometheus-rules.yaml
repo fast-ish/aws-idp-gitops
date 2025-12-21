@@ -1,0 +1,81 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: trivy-vulnerability-alerts
+  namespace: trivy-system
+  labels:
+    app.kubernetes.io/name: trivy-operator
+    release: prometheus
+spec:
+  groups:
+    - name: trivy-vulnerabilities
+      rules:
+        # Alert on critical vulnerabilities
+        - alert: CriticalVulnerabilityDetected
+          expr: |
+            sum by (namespace, image_repository, image_tag) (
+              trivy_image_vulnerabilities{severity="Critical"}
+            ) > 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Critical vulnerability in {{ $labels.namespace }}"
+            description: |
+              Image {{ $labels.image_repository }}:{{ $labels.image_tag }}
+              has {{ $value }} critical vulnerabilities in namespace {{ $labels.namespace }}
+
+        # Alert on high vulnerability count
+        - alert: HighVulnerabilityCount
+          expr: |
+            sum by (namespace) (
+              trivy_image_vulnerabilities{severity=~"Critical|High"}
+            ) > 10
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "High vulnerability count in {{ $labels.namespace }}"
+            description: "Namespace {{ $labels.namespace }} has {{ $value }} high/critical vulnerabilities"
+
+        # Alert on exposed secrets
+        - alert: ExposedSecretDetected
+          expr: |
+            sum by (namespace, image_repository) (
+              trivy_image_exposedsecrets{severity="CRITICAL"}
+            ) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Exposed secret detected in {{ $labels.namespace }}"
+            description: |
+              Image {{ $labels.image_repository }} has exposed secrets in namespace {{ $labels.namespace }}
+
+        # Alert on RBAC misconfigurations
+        - alert: RBACMisconfiguration
+          expr: |
+            sum by (namespace) (
+              trivy_rbacassessments{severity="CRITICAL"}
+            ) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RBAC misconfiguration in {{ $labels.namespace }}"
+            description: "Namespace {{ $labels.namespace }} has critical RBAC misconfigurations"
+
+        # Alert on config audit failures
+        - alert: ConfigAuditCritical
+          expr: |
+            sum by (namespace, resource_name) (
+              trivy_resource_configaudits{severity="CRITICAL"}
+            ) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Config audit failure in {{ $labels.namespace }}"
+            description: |
+              Resource {{ $labels.resource_name }} in {{ $labels.namespace }}
+              has critical configuration issues
